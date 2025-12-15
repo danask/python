@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Editor directories
+.vscode/
+.idea/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Local project folder that is a separate repo
+python/
+
+# Misc
+*.log
+.env
