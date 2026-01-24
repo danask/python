@@ -1,3 +1,128 @@
+
+소프트웨어 전문가로서 분석해 볼 때, 부팅 시 도구 리스트가 한 번에 나오지 않는 이유는 **MCP 서버의 비동기 초기화 지연(Handshake Latency)** 때문입니다. MCP 서버가 프로세스로 실행되고 `list_tools` 응답을 줄 때까지 약간의 시간이 필요한데, 에이전트 생성 로직이 이보다 먼저 실행되면 도구가 누락된 것처럼 보일 수 있습니다.
+
+이를 해결하기 위해 **1) 재시도 로직이 포함된 부팅 로그**, **2) 실행 시점의 쿼리 로그**, **3) 상태 변화 실시간 로그**를 포함한 모니터링 강화 방안을 제안합니다.
+
+---
+
+### 1. 부팅 시 도구 리스트 완벽 로깅 (Retry Mechanism)
+
+`agent.py`에서 도구를 가져올 때, 서버가 준비될 때까지 최대 3번 정도 재시도하며 로그를 남기는 구조로 변경하세요.
+
+**[agent.py 수정 제안]**
+
+```python
+import asyncio
+from common.logger import logger
+
+def discover_mcp_tools_with_retry(max_retries=3, delay=2):
+    """MCP 도구 리스트를 안정적으로 가져오기 위한 재시도 로직"""
+    for i in range(max_retries):
+        # 기존 get_tools 호출
+        toolsets = get_tools(
+            server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+            allow_list=["get", "list_", "kai-"], # 예시
+            require_confirmation=False,
+        )
+        
+        # 실제 도구 개수 파악
+        total_tools = sum(len(getattr(ts, 'tools', [])) for ts in toolsets)
+        
+        if total_tools > 0:
+            logger.info(f"=== [BOOT] MCP Discovery Success (Attempt {i+1}) ===")
+            logger.info(f"Total Toolsets: {len(toolsets)} | Total Tools: {total_tools}")
+            # 전체 리스트 출력
+            for ts in toolsets:
+                for t in getattr(ts, 'tools', []):
+                    logger.info(f" - Found Tool: [{t.name}] - {t.description[:50]}...")
+            return toolsets
+        
+        logger.warning(f"[BOOT] MCP tools not ready yet (Attempt {i+1}/{max_retries}). Retrying in {delay}s...")
+        time.sleep(delay)
+    
+    logger.error("!!! [BOOT] Failed to discover any MCP tools after retries !!!")
+    return []
+
+```
+
+---
+
+### 2. 현재 쿼리 및 진행 상태 실시간 로깅
+
+`long_running_wrapper.py` 내부에 에이전트가 어떤 도구를 호출했는지(Query), 그리고 현재 상태가 무엇인지 명확한 식별자(`operation_id`)와 함께 로그를 남깁니다.
+
+**[long_running_wrapper.py 수정 제안]**
+
+```python
+def create_long_running_tool(self, mcp_toolset, tool_name, ...):
+    def long_running_mcp_function(**kwargs):
+        # 1. 쿼리 시작 로그 (에이전트가 툴을 건드리는 순간)
+        operation_id = f"OP-{int(time.time())}"
+        logger.info(f"▶️ [QUERY START] Agent invoked Tool: [{tool_name}]")
+        logger.info(f"   - Operation ID: {operation_id}")
+        logger.info(f"   - Arguments: {kwargs}")
+
+        # ... (중략: operation_info 생성 로직) ...
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._execute_mcp_tool_simple(...))
+            # 2. 상태 전환 로그
+            logger.info(f"⏳ [STATUS CHANGE] {operation_id} : PENDING (Background task started)")
+        except Exception as e:
+            logger.error(f"❌ [CRITICAL ERROR] Failed to spawn task: {str(e)}")
+
+        return { "operation_id": operation_id, "status": "started" }
+    
+    # ... (생략) ...
+
+async def _execute_mcp_tool_simple(self, operation_id, ...):
+    op_info = self._active_operations.get(operation_id)
+    tool_name = op_info['tool_name']
+
+    # 3. 상세 진행 로그
+    logger.info(f"🔄 [PROGRESS] {operation_id} ({tool_name}): Fetching data from MCP server...")
+    
+    try:
+        # 실제 호출 직전
+        result = await self._call_mcp_tool(...)
+        
+        # 4. 완료 로그
+        op_info["status"] = "completed"
+        logger.info(f"✅ [QUERY SUCCESS] {operation_id} ({tool_name}): Execution finished.")
+    except Exception as e:
+        logger.error(f"🚨 [QUERY FAILED] {operation_id} ({tool_name}): {str(e)}")
+
+```
+
+---
+
+### 3. 로그 시각화 대시보드 구조 (Log Snapshot)
+
+로그를 한눈에 보기 위해, 콘솔이나 별도 모니터링 엔드포인트에서 다음과 같은 형식으로 출력되도록 구성하면 매우 직관적입니다.
+
+**추천 로그 포맷:**
+
+```text
+[2026-01-24 15:40:00] [BOOT] Found 25 tools.
+[2026-01-24 15:42:10] ▶️ [QUERY] 'kai-app_getAppUsageList' | ID: OP-123 | Args: {'days': 7}
+[2026-01-24 15:42:11] ⏳ [PENDING] OP-123 | Step: init_mcp_call
+[2026-01-24 15:42:15] ✅ [COMPLETED] OP-123 | Result: 5.2KB data received.
+
+```
+
+---
+
+### 4. 전문가의 마지막 팁: 왜 부팅 시 안 보였을까?
+
+1. **Asyncio Loop:** MCP Client 세션이 비동기 루프에서 완전히 초기화되기 전에 `get_tools`가 실행되었기 때문입니다. 위에서 제안한 `time.sleep` 기반의 Retry 로직을 `agent.py`의 `create_agent` 시작 부분에 넣으시면 해결됩니다.
+2. **Server Process Speed:** MCP 서버(특히 Node.js 기반)는 프로세스 구동 후 `JSON-RPC` 핸드쉐이크까지 약 1~2초가 소요됩니다.
+
+**다음 단계로 무엇을 해드릴까요?**
+이 로그들을 **텍스트 파일로 실시간 기록(File Logging)**하게 해드릴까요, 아니면 **에이전트가 이 로그 내용을 읽어서 사용자에게 보고**하게 만드는 프롬프트를 짜드릴까요?
+
+-----
+
 소프트웨어 전문가로서, 앞서 지적한 **도구 식별 문제(Name/Description 누락)**와 **인자 필터링(Argument Filtering)**, 그리고 **에이전트의 워크플로우 인지 능력**을 대폭 강화한 개선 코드를 작성해 드립니다.
 
 가장 중요한 변경점은 에이전트가 "이 도구가 어떤 역할을 하는지" 명확히 알 수 있도록 원본 MCP 도구의 메타데이터를 래핑된 도구에 이식한 것입니다.
