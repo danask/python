@@ -1,3 +1,131 @@
+소프트웨어 전문가로서, 에이전트가 호출하는 도구가 **일반 MCP 도구인지 아니면 롱러닝 래퍼(Wrapper)인지 로그상에서 이름만 보고도 100% 확신할 수 있도록** 접두어(`LR_`)를 추가하고, 이를 에이전트에게 등록하는 개선 코드를 작성해 드립니다.
+
+이 코드를 적용하면 에이전트 로그에 `Calling tool: LR_kai-app_getAppUsageList`와 같이 찍히게 됩니다.
+
+---
+
+### 1. `long_running_wrapper.py` (이름 설정 기능 추가)
+
+래퍼 내부에서 생성되는 도구 객체에 에이전트용 이름을 명시적으로 부여할 수 있도록 수정합니다.
+
+```python
+# long_running_wrapper.py 수정본
+
+def create_long_running_tool(
+    self,
+    mcp_toolset: McpToolset,
+    tool_name: str,
+    agent_tool_name: str = None, # 에이전트에게 보여줄 이름 인자 추가
+    estimated_duration: int = DEFAULT_ESTIMATED_DURATION,
+    tool_timeout: int = DEFAULT_TOOL_TIMEOUT,
+) -> LongRunningFunctionTool:
+    
+    async def long_running_mcp_function(**kwargs) -> dict[str, Any]:
+        # 실행 시점에 어떤 이름을 통해 들어왔는지 로그를 남김
+        current_name = agent_tool_name or tool_name
+        logger.info(f"🧩 [LR-WRAPPER-HIT] Executing: {current_name} (Mapped to: {tool_name})")
+        
+        # ... 기존 로직 (operation_id 생성 및 background task 실행) ...
+        # (생략: 이전 답변에서 드린 필터링 및 비동기 실행 로직 포함)
+        return {
+            "status": "started",
+            "operation_id": f"op_{int(time.time())}",
+            "message": f"작업 {current_name}이 백그라운드에서 시작되었습니다."
+        }
+
+    tool = LongRunningFunctionTool(func=long_running_mcp_function)
+    
+    # [중요] 에이전트가 이 이름으로 도구를 인식하고 로그에 남깁니다.
+    tool.name = agent_tool_name if agent_tool_name else tool_name
+    return tool
+
+# 편의 함수 수정
+def create_long_running_mcp_tool(mcp_toolset, tool_name, agent_tool_name=None, **kwargs):
+    return mcp_long_running_manager.create_long_running_tool(
+        mcp_toolset, tool_name, agent_tool_name=agent_tool_name, **kwargs
+    )
+
+```
+
+---
+
+### 2. `agent.py` (접두어 부여 및 도구 필터링 로직)
+
+에이전트에 도구를 등록할 때 **롱러닝 대상은 접두어를 붙이고, 원본은 제외**하여 에이전트가 헷갈리지 않게 합니다.
+
+```python
+# agent.py 수정본
+
+def create_agent():
+    allow_list = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+    long_running_patterns = ["get_", "list_", "usage", "report", "kai-"] # 롱러닝 대상 패턴
+
+    mcp_toolsets = get_tools(...) # 기존 로드 로직
+
+    final_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    logger.info("🛠️ [BOOT] Starting tool registration...")
+
+    for toolset in mcp_toolsets:
+        actual_tools = getattr(toolset, "tools", [])
+        for tool in actual_tools:
+            tool_name = tool.name
+            
+            # 롱러닝 대상인지 확인
+            is_lr = any(p in tool_name.lower() for p in long_running_patterns)
+            
+            if is_lr:
+                # [개선 핵심] 이름 앞에 LR_ 을 붙여서 등록
+                lr_display_name = f"LR_{tool_name}"
+                logger.info(f"   - Registering Wrapped Tool: {lr_display_name}")
+                
+                lr_tool = create_long_running_mcp_tool(
+                    toolset, 
+                    tool_name,           # 실제 호출할 원본 이름
+                    agent_tool_name=lr_display_name # 에이전트가 인식할 이름
+                )
+                final_tools.append(lr_tool)
+            else:
+                # 롱러닝 대상이 아닌 일반 도구는 그대로 추가
+                logger.info(f"   - Registering Simple Tool: {tool_name}")
+                final_tools.append(tool)
+
+    # 이제 final_tools에는 'LR_...' 이름의 도구와 일반 도구만 섞여있고, 
+    # 롱러닝 대상의 '원본 이름' 도구는 제거된 상태입니다.
+
+    return Agent(
+        # ... 나머지 설정 동일 ...
+        tools=final_tools,
+        instruction=f"{INSTRUCTION}\n참고: 이름이 'LR_'로 시작하는 도구는 실행 시 즉시 결과가 나오지 않고 operation_id를 반환합니다."
+    )
+
+```
+
+---
+
+### 3. 이렇게 하면 로그가 어떻게 바뀌나요?
+
+이제 에이전트 실행 시 터미널 로그를 보시면 다음과 같이 명확히 구분됩니다.
+
+* **성공적으로 래퍼를 탈 때:**
+`[INFO] Agent is calling tool: 'LR_kai-app_getAppUsageList'`
+`[INFO] 🧩 [LR-WRAPPER-HIT] Executing: LR_kai-app_getAppUsageList (Mapped to: kai-app_getAppUsageList)`
+`[INFO] Response from tool: {'status': 'started', 'operation_id': 'op_12345'}`
+* **만약 래퍼를 안 탔다면 (이전 방식):**
+`[INFO] Agent is calling tool: 'kai-app_getAppUsageList'` (앞에 LR_이 없음)
+`[INFO] Response from tool: [{"app": "YouTube", ...}]` (데이터가 바로 나옴)
+
+### 4. 추가 팁: 부팅 시 도구 목록 확인
+
+서버 실행 시 로그에 `Registering Wrapped Tool: LR_...` 가 20개 이상 출력되는지 확인하세요. 만약 이 로그가 안 찍힌다면 `long_running_patterns`와 `tool_name`이 매칭되지 않는 것이므로 패턴을 조정해야 합니다.
+
+이제 이 코드를 적용하시면 에이전트가 어떤 경로로 쿼리를 날리는지 눈으로 즉시 확인하실 수 있습니다! 바로 적용해 보시겠어요?
+
+----
 
 소프트웨어 전문가로서 분석해 볼 때, 부팅 시 도구 리스트가 한 번에 나오지 않는 이유는 **MCP 서버의 비동기 초기화 지연(Handshake Latency)** 때문입니다. MCP 서버가 프로세스로 실행되고 `list_tools` 응답을 줄 때까지 약간의 시간이 필요한데, 에이전트 생성 로직이 이보다 먼저 실행되면 도구가 누락된 것처럼 보일 수 있습니다.
 
