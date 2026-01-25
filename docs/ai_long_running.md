@@ -1,3 +1,158 @@
+소프트웨어 전문가로서 정확한 진단을 내리셨습니다. MCP 서버는 별도의 프로세스로 구동되기 때문에, 에이전트가 실행되는 시점(Import 또는 구동 직후)에 `get_tools`를 호출하면 서버와의 핸드쉐이크가 완료되지 않아 도구 목록이 비어 있는 경우가 많습니다.
+
+이를 해결하기 위해 에이전트 생성 후 도구를 나중에 채워넣는 **포스트 프로세싱(Post-processing)** 또는 **지연 초기화(Lazy Initialization)** 방식이 실무에서 훨씬 안정적입니다.
+
+사용자님의 환경에 맞춰 **"부팅 시에는 대기하고, 첫 요청이나 특정 시점에 도구를 동적으로 변환하여 주입"**하는 코드를 제안합니다.
+
+---
+
+### 1. `long_running_wrapper.py` (이름 식별 기능 포함)
+
+에이전트 로그에 `LR_` 접두어가 찍히도록 명시적으로 이름을 받는 로직을 추가한 버전입니다.
+
+```python
+# long_running_wrapper.py
+
+def create_long_running_tool(
+    self,
+    mcp_toolset,
+    tool_name,
+    agent_tool_name=None, # 에이전트 인식용 이름 추가
+    estimated_duration=DEFAULT_ESTIMATED_DURATION,
+    tool_timeout=DEFAULT_TOOL_TIMEOUT,
+):
+    async def long_running_mcp_function(**kwargs):
+        # 실행 시점에 어떤 이름으로 들어왔는지 로그 확인
+        display_name = agent_tool_name or tool_name
+        logger.info(f"🧩 [LR-WRAPPER-HIT] Executing: {display_name} (Mapped to original: {tool_name})")
+        
+        # ... (중략: 기존 operation 생성 및 백그라운드 태스크 실행 로직) ...
+        return {
+            "status": "started",
+            "operation_id": f"op_{int(time.time())}",
+            "message": f"{display_name} 작업이 백그라운드에서 시작되었습니다."
+        }
+
+    # [중요] 에이전트가 이 name을 보고 로그에 남깁니다.
+    tool = LongRunningFunctionTool(func=long_running_mcp_function)
+    tool.name = agent_tool_name if agent_tool_name else tool_name
+    return tool
+
+```
+
+---
+
+### 2. `agent.py` (포스트 프로세싱/지연 초기화 방식)
+
+부팅 시 도구가 없더라도 에이전트를 먼저 만들고, 도구가 준비되었을 때 `LR_` 접두어를 붙여 동적으로 업데이트하는 구조입니다.
+
+```python
+# agent.py
+
+# 전역 변수로 관리하여 나중에 업데이트 가능하게 설정
+_device_info_agent = None
+
+def create_agent():
+    # 1. 기본 도구들만 먼저 정의
+    base_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    # 2. 에이전트 초기 생성 (이때는 MCP 도구가 없을 수 있음)
+    agent = Agent(
+        model=BEDROCK_AI_MODEL,
+        name="device_info",
+        description=DESCRIPTION,
+        tools=base_tools, # 우선 기본 도구만 주입
+        instruction=INSTRUCTION,
+        planner=BuiltInPlanner(thinking_config=types.ThinkingConfig(include_thoughts=True)),
+        # ... 나머지 설정 ...
+    )
+    return agent
+
+def refresh_agent_tools():
+    """포스트 프로세싱: MCP 서버에서 도구를 다시 읽어와 LR 접두어를 붙여 에이전트 도구함 갱신"""
+    global root_agent
+    
+    allow_list = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+    long_running_patterns = ["get_", "list_", "usage", "report", "kai-"]
+
+    # MCP 도구 가져오기
+    mcp_toolsets = get_tools(
+        server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+        allow_list=allow_list,
+        require_confirmation=False,
+    )
+
+    new_tools = [convert_timestamp_to_datetime, load_compacted_response, check_mcp_operation_status_tool]
+    
+    found_any = False
+    for toolset in mcp_toolsets:
+        actual_tools = getattr(toolset, "tools", [])
+        for tool in actual_tools:
+            found_any = True
+            # 롱러닝 패턴이면 LR_ 접두어 추가하여 변환
+            if any(p in tool.name.lower() for p in long_running_patterns):
+                lr_display_name = f"LR_{tool.name}"
+                wrapped_tool = create_long_running_mcp_tool(
+                    toolset, 
+                    tool.name, 
+                    agent_tool_name=lr_display_name
+                )
+                new_tools.append(wrapped_tool)
+                logger.info(f"✅ [POST-PROCESS] Wrapped: {lr_display_name}")
+            else:
+                new_tools.append(tool)
+
+    if found_any:
+        # 에이전트의 도구 리스트를 통째로 교체
+        root_agent.tools = new_tools
+        logger.info(f"🚀 [POST-PROCESS] Agent tools updated. Total: {len(new_tools)}")
+    
+    return found_any
+
+# 서버 시작 시 혹은 첫 요청 전 호출
+root_agent = create_agent()
+
+```
+
+---
+
+### 3. 컨트롤러에서 적용 (Controller.py)
+
+사용자가 요청을 보낼 때, 도구가 아직 없다면 `refresh_agent_tools()`를 한 번 실행해 주는 방식이 가장 안전합니다.
+
+```python
+# controller.py 
+
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    # 포스트 프로세싱 실행: 도구가 아직 안 불려왔을 경우를 대비
+    # (이미 불려왔다면 내부 로직에서 체크하여 빠르게 넘어가게 설계 가능)
+    refresh_agent_tools() 
+    
+    return await _handle_chat_request(
+        agent_name="device_info",
+        # ... 나머지 인자 ...
+    )
+
+```
+
+---
+
+### 4. 이 방식의 장점
+
+1. **부팅 속도 개선:** MCP 서버가 뜰 때까지 `create_agent`가 블록되지 않습니다.
+2. **로그 가독성:** `agent.py`에서 접두어를 붙였기 때문에, 터미널 로그에 `Agent is calling tool: LR_kai-app_getAppUsageList`라고 찍혀서 래퍼 작동 여부를 즉시 알 수 있습니다.
+3. **유연성:** MCP 서버가 나중에 추가되거나 재구동되어도 `refresh_agent_tools`만 호출하면 에이전트를 새로 만들 필요 없이 도구만 갈아끼울 수 있습니다.
+
+**전문가의 조언:** 만약 포스트 프로세싱으로도 도구가 안 나타난다면, 그것은 타이밍 문제가 아니라 `allow_list`나 `long_running_patterns` 매칭 문제입니다. 위 코드를 적용한 후 터미널에 `✅ [POST-PROCESS] Wrapped: LR_...` 로그가 찍히는지 꼭 확인해 보세요! 찍힌다면 그때부터는 100% 롱러닝 래퍼를 사용하게 됩니다.
+
+
+-----
+
 소프트웨어 전문가로서, 에이전트가 호출하는 도구가 **일반 MCP 도구인지 아니면 롱러닝 래퍼(Wrapper)인지 로그상에서 이름만 보고도 100% 확신할 수 있도록** 접두어(`LR_`)를 추가하고, 이를 에이전트에게 등록하는 개선 코드를 작성해 드립니다.
 
 이 코드를 적용하면 에이전트 로그에 `Calling tool: LR_kai-app_getAppUsageList`와 같이 찍히게 됩니다.
