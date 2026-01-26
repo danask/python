@@ -1,3 +1,113 @@
+소프트웨어 전문가로서 답변드립니다. `already defined` 에러는 **동일한 이름의 도구가 에이전트의 도구 리스트(`root_agent.tools`)에 중복으로 등록**되려 할 때 발생합니다. 특히 `refresh_agent_tools`를 여러 번 호출하거나, 기존 리스트에 `extend`나 `append`를 반복하면서 발생했을 가능성이 큽니다.
+
+결론부터 말씀드리면, **초기 부팅 시 `async/await`로 처리하는 것이 가장 깔끔하고 권장되는 방식**입니다. 다만, 메인 루프가 뜨기 전이므로 `asyncio.run()` 또는 별도의 초기화 루틴을 사용해야 합니다.
+
+가장 안정적인 **초기 부팅 시점의 동기화 코드**를 제안해 드립니다.
+
+---
+
+### 1. `agent.py` 수정: 부팅 시 비동기 초기화
+
+에이전트를 생성하는 함수 자체를 `async`로 만들거나, 내부에서 도구를 완전히 준비한 후 에이전트를 반환하도록 수정합니다.
+
+```python
+# agent.py
+
+async def create_agent_async():
+    name = "device_info"
+    allow_list = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+    
+    # 1. 도구셋을 비동기로 확실히 가져옴
+    mcp_toolsets = get_tools(
+        server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+        allow_list=allow_list,
+        require_confirmation=False,
+        header_provider=header_provider,
+    )
+
+    # 2. 기본 도구 정의
+    final_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    # 3. 롱러닝 래퍼 적용 (중복 방지를 위해 set이나 dict 활용 가능하지만, 여기선 새로 생성)
+    long_running_patterns = ["get_", "list_", "usage", "report", "kai-"]
+    
+    for toolset in mcp_toolsets:
+        # 비동기로 실제 도구 목록을 끝까지 기다려 가져옴
+        actual_tools = await toolset.get_tools() if hasattr(toolset, "get_tools") else getattr(toolset, "tools", [])
+        
+        for tool in actual_tools:
+            if any(p in tool.name.lower() for p in long_running_patterns):
+                lr_name = f"LR_{tool.name}"
+                # 래퍼 생성 및 이름 부여
+                wrapped = create_long_running_mcp_tool(toolset, tool.name)
+                wrapped.name = lr_name 
+                final_tools.append(wrapped)
+                logger.info(f"✅ [BOOT] Wrapped: {lr_name}")
+            else:
+                final_tools.append(tool)
+
+    # 4. 에이전트 생성 및 반환
+    return Agent(
+        model=BEDROCK_AI_MODEL,
+        name=name,
+        tools=final_tools, # 완성된 리스트 주입
+        instruction=f"{INSTRUCTION}\n참고: 'LR_' 도구는 비동기로 동작합니다.",
+        planner=BuiltInPlanner(thinking_config=types.ThinkingConfig(include_thoughts=True)),
+        # ... 나머지 설정 ...
+    )
+
+# 전역 변수 초기화 방식 (서버 부팅 시점)
+root_agent = None
+
+async def init_root_agent():
+    global root_agent
+    root_agent = await create_agent_async()
+    logger.info("🚀 [SYSTEM] Root Agent is fully initialized with MCP tools.")
+
+```
+
+---
+
+### 2. 메인 실행부 (FastAPI 등)에서의 호출
+
+애플리케이션이 시작될 때(`lifespan` 또는 `on_event("startup")`) 위 `init_root_agent`를 한 번만 호출하면 됩니다.
+
+```python
+# main.py 또는 server.py
+@app.on_event("startup")
+async def startup_event():
+    # 부팅 시 딱 한 번만 실행하여 도구를 세팅합니다.
+    await init_root_agent()
+
+```
+
+---
+
+### 3. 왜 `already defined`가 떴을까?
+
+원인은 크게 두 가지입니다:
+
+1. **중복 리스트 추가**: `tools.extend(long_running_tools)`를 호출할 때, `long_running_tools` 안에 이미 존재하는 도구 이름이 들어있었기 때문입니다.
+2. **`refresh` 로직의 누적**: `root_agent.tools = new_tools`로 교체하지 않고 `root_agent.tools.append()`를 사용했다면 호출할 때마다 도구가 늘어납니다.
+
+---
+
+### 4. 전문가의 조언: 이렇게 확인하세요
+
+부팅 시 `async/await` 처리를 적용한 후, 로그에 다음과 같은 흐름이 보이는지 확인하세요.
+
+1. `📡 [BOOT] Checking MCP Tools...`
+2. `✅ [BOOT] Wrapped: LR_kai-app_getAppUsageList` (이게 20여 개 쭉 나와야 함)
+3. `🚀 [SYSTEM] Root Agent is fully initialized...`
+
+이렇게 **부팅 시점에 한 번에 비동기로 처리**하면, 컨트롤러에서 매번 `refresh`를 호출할 필요도 없고 `already defined` 같은 이름 충돌 문제도 완벽하게 해결됩니다. 지금 바로 `create_agent`를 `async` 버전으로 교체해 보시겠어요?
+
+-----
+
 소프트웨어 전문가로서 분석해 본 결과, `refresh_agent_tools` 함수 내에서 `get_tools`를 호출했을 때 값이 없는 이유는 **`get_tools` 함수가 비동기(Async) 방식으로 동작해야 함에도 불구하고 동기 방식으로 호출되었거나, 내부적으로 사용 중인 `McpToolset` 객체들이 아직 서버로부터 도구 목록을 수신(Fetch)하지 못한 상태**이기 때문입니다.
 
 특히 제공해주신 `agent.py` 코드를 보면, `get_tools`가 반환하는 `toolset` 내부에 `tools` 속성이 없을 경우를 대비해 `asyncio.run(current_toolset.get_tools())`를 사용하는 복잡한 로직이 이미 포함되어 있습니다. 이는 MCP 도구 로딩이 단순히 함수 호출 한 번으로 끝나는 게 아니라 네트워크 통신이 필요한 비동기 작업임을 의미합니다.
