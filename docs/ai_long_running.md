@@ -1,4 +1,95 @@
 
+소프트웨어 전문가로서 현재 겪고 계신 문제를 정밀 진단해 드립니다. 자바 개발자 입장에서 이 현상은 **"데이터 스키마 불일치(Schema Mismatch)"**와 **"객체 참조의 파편화(Object Reference Fragmentation)"** 문제입니다.
+
+결론부터 말씀드리면, **`LR_` 접두어를 쓰지 않고 원본 이름 그대로 래핑**하되, **에이전트 내부의 도구 관리 방식(Tool Mapping)**을 강제로 동기화해야 합니다.
+
+---
+
+### 1. `DeviceInfo` 스키마 매칭 에러 원인
+
+`DeviceInfo`는 LLM이 최종 응답을 줄 때 지켜야 하는 **"자바의 인터페이스/DTO"** 같은 역할을 합니다.
+
+* **원인**: LLM은 도구를 실행하고 나온 결과값을 `full_output`에 담아야 하는데, 도구가 래핑되면서 리턴 형식이 `{"status": "started", "operation_id": "..."}`로 바뀌었습니다.
+* **해결**: LLM이 이 중간 상태(operation_id)를 결과가 아닌 **"진행 중인 과정"**으로 인식하게 하려면, 에이전트 생성 시 주입하는 `instruction`에서 이 도구들이 "비동기"임을 더 명확히 인지시켜야 합니다. (이 부분은 도구 이름 동기화 후 해결됩니다.)
+
+### 2. LLM이 원본 이름을 쿼리하는 이유 (불일치 문제)
+
+컨트롤러에서 `agent.tools`를 갱신했지만, ADK 내부의 **`Planner`**나 **`Runner`**가 에이전트 생성 시점의 도구 목록을 별도의 캐시(Cache)나 맵(Map)으로 보관하고 있을 가능성이 큽니다. 즉, 껍데기만 바뀌고 알맹이는 예전 정보를 보고 있는 것이죠.
+
+### 3. 최종 해결책: 이름 변경 없이 "인플레이스 패치(In-place Patch)"
+
+`LR_` 접두어를 포기하고, 원본 도구 이름을 그대로 유지하면서 기능을 래핑하는 방식이 스키마 에러와 이름 불일치를 동시에 잡는 가장 깔끔한 방법입니다.
+
+#### **수정된 `refresh_agent_tools` (agent.py)**
+
+이 방식은 자바의 **바이트코드 조작(Proxy)**과 유사하게 작동합니다.
+
+```python
+async def refresh_agent_tools(agent):
+    """이름을 유지한 채 도구의 실행 로직만 롱러닝으로 교체"""
+    mcp_toolsets = get_tools(...)
+    
+    # 1. 새로운 도구 리스트 생성 (기본 툴 포함)
+    updated_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    for toolset in mcp_toolsets:
+        actual_tools = await toolset.get_tools() if hasattr(toolset, "get_tools") else []
+        for tool in actual_tools:
+            # 원본 이름을 그대로 사용 (LR_ 붙이지 않음)
+            original_name = tool.name
+            
+            # 롱러닝 래퍼 생성 (이름은 원본 그대로 주입)
+            wrapped = create_long_running_mcp_tool(
+                toolset, 
+                original_name,
+                description=getattr(tool, 'description', "")
+            )
+            # 래퍼 객체의 이름을 원본과 동일하게 강제 설정
+            wrapped.name = original_name 
+            updated_tools.append(wrapped)
+            logger.info(f"✅ [PATCH] Tool logic replaced (Name kept): {original_name}")
+
+    # 2. 에이전트 객체에 직접 할당
+    agent.tools = updated_tools
+    
+    # [핵심] 만약 ADK가 내부 맵을 사용한다면 강제 갱신 로직이 필요할 수 있음
+    if hasattr(agent, "_tool_map"):
+        agent._tool_map = {t.name: t for t in updated_tools if hasattr(t, 'name')}
+
+```
+
+---
+
+### 4. LLM이 실제로 보는 도구 목록 확인법
+
+LLM이 어떤 도구를 알고 있는지, 그리고 어떤 도구를 호출하려 하는지 캐치하려면 **`before_agent_callback`**이나 **로그 레벨 조절**이 필요합니다.
+
+* **로그로 확인**: `google.adk`의 로그 레벨을 `DEBUG`로 낮추면 LLM에게 전달되는 `System Prompt`에 포함된 도구 정의(JSON Schema)를 볼 수 있습니다.
+* **코드로 확인**: `controller.py`에서 실행 직전에 아래 코드를 넣어보세요.
+
+```python
+# controller.py
+logger.info(f"🔍 [DEBUG] Current Agent Knowledge: {[t.name for t in agent.tools]}")
+
+```
+
+### **전문가의 최종 제언 (자바 개발자 맞춤형)**
+
+1. **`LR_` 접두어 제거**: 스키마 매칭 에러(`DeviceInfo`)의 주범일 확률이 높습니다. 이름을 원본과 똑같이 유지하면 LLM은 평소처럼 도구를 부르지만, 실제로는 우리가 가로챈(Intercept) 롱러닝 로직이 실행됩니다.
+2. **`DeviceInfo` 에러**: 도구가 `operation_id`를 리턴할 때, `DeviceInfo` 스키마는 `list[ComponentWrapper]`를 기대하므로 형식이 맞지 않아 터지는 것입니다.
+* **해결책**: 래퍼가 리턴하는 값을 `ComponentWrapper` 형식에 맞게 감싸거나, `DeviceInfo`의 필드를 좀 더 유연하게(Optional 등) 수정해야 합니다.
+
+
+3. **동기화**: `agent.tools = updated_tools` 직후에 `agent.planner` 객체가 있다면 `agent.planner.tools = updated_tools` 처럼 플래너의 도구함도 같이 갱신해 주어야 LLM이 갱신된 목록을 봅니다.
+
+**"이름은 그대로 두고 내부 로직만 갈아끼우는"** 이 방식으로 수정해 보시겠어요? 이름이 같아지면 LLM의 쿼리 불일치 문제는 즉시 사라질 것입니다. `DeviceInfo` 매칭 에러가 계속 난다면 그 리턴값의 데이터 구조(JSON)만 맞춰주면 됩니다. 도와드릴까요?
+
+-----
+
 로그를 분석해 보니 소프트웨어 전문가로서 매우 익숙한 이슈가 발견되었습니다. 이 에러는 **`asyncio.CancelledError`**와 **`RuntimeError: Attempted to exit cancel scope...`**가 결합된 형태입니다.
 
 자바 개발자 관점에서 설명하자면, 이 상황은 **"메인 스레드가 비동기 작업을 기다리다가 타임아웃이나 예외로 인해 연결을 끊었는데(Cancelled), 그 사이에 다른 스레드(Task)가 MCP 도구들을 로드하려고 시도하다가 충돌이 발생"**한 것입니다.
