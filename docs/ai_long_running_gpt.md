@@ -1,7 +1,199 @@
 
+아주 좋은 로그 가져오셨어요. 이 에러는 **구조를 잘못 짠 게 아니라, 딱 “한 군데”가 어긋난 전형적인 ADK 함정**입니다.
+차분하게 짚어볼게요.
+
+---
+
+## 🔥 에러의 정확한 의미
+
+```
+Tool 'run_mcp_long_running_proxy' not found.
+Available tools:
+- set_model_response
+- convert_timestamp_to_datetime
+- load_compacted_response
+- mcp_long_running
+```
+
+👉 **ADK가 찾은 tool 이름은 `mcp_long_running`뿐인데**
+👉 **LLM이 `run_mcp_long_running_proxy`를 호출하려고 했다**는 뜻입니다.
+
+즉,
+
+> ❌ LLM이 “파이썬 함수 이름”을 tool 이름이라고 착각
+> ✅ ADK는 “Tool 객체의 name”만 인식
+
+---
+
+## 1️⃣ 왜 이런 일이 생겼나 (핵심 원인)
+
+### 지금 구조를 정확히 보면
+
+```python
+def run_mcp_long_running_proxy(...):
+    ...
+    
+mcp_long_running_proxy_tool = LongRunningFunctionTool(
+    name="mcp_long_running",   # ← ADK가 인식하는 이름
+    func=run_mcp_long_running_proxy,  # ← 내부 파이썬 함수
+)
+```
+
+ADK 관점에서는:
+
+| 구분                             | 이름                           |
+| ------------------------------ | ---------------------------- |
+| **Tool name (LLM이 호출해야 할 이름)** | `mcp_long_running`           |
+| Python 함수 이름                   | `run_mcp_long_running_proxy` |
+
+그런데 지금 LLM이:
+
+```
+functionCall.name = "run_mcp_long_running_proxy"
+```
+
+를 만들어버린 거예요.
+
+👉 이건 **LLM 프롬프트/설명에서 “func 이름이 노출됐기 때문”**입니다.
+
+---
+
+## 2️⃣ 가장 중요한 규칙 (ADK에서 절대 깨면 안 되는 것)
+
+> **LLM은 절대 Python 함수 이름을 알면 안 된다**
+> **LLM은 오직 `LongRunningFunctionTool.name`만 알아야 한다**
+
+---
+
+## 3️⃣ 바로 고쳐야 할 것 (100% 해결)
+
+### ✅ 1. instruction / description에서 함수 이름 언급 제거
+
+❌ 이런 문구가 있으면 안 됩니다:
+
+```text
+Call run_mcp_long_running_proxy to execute MCP tools
+```
+
+❌ 혹은 이런 식의 암시도 위험
+
+```text
+Use the function run_mcp_long_running_proxy
+```
+
+---
+
+### ✅ 올바른 instruction 예시 (이대로 쓰세요)
+
+```python
+instruction = f"""
+{INSTRUCTION}
+
+MCP tools MUST be executed via the tool named `mcp_long_running`.
+
+Usage:
+- Call `mcp_long_running`
+- Provide:
+  - tool_name: the exact MCP tool name (e.g. kai-app_getManagedApps)
+  - tool_args: arguments for that tool
+
+Do NOT call MCP tools directly.
+Do NOT invent tool names.
+"""
+```
+
+👉 **`run_mcp_long_running_proxy`라는 문자열이 시스템 어디에도 나오면 안 됨**
+
+---
+
+## 4️⃣ “wrapping 된 kai-app_getManagedApps 형태로 실행돼야 하는데?”에 대한 정확한 설명
+
+이 부분도 오해가 하나 있어요.
+
+### ❌ 기대 (잘못된 기대)
+
+> LLM이 `kai-app_getManagedApps`를 직접 호출해야 한다
+
+### ✅ 실제 구조 (지금 설계가 맞음)
+
+* LLM은 **절대 `kai-app_getManagedApps`를 tool로 호출하지 않음**
+* LLM은 항상 이것만 호출함:
+
+```json
+{
+  "name": "mcp_long_running",
+  "args": {
+    "tool_name": "kai-app_getManagedApps",
+    "tool_args": {...}
+  }
+}
+```
+
+그리고 **proxy 내부에서만**:
+
+```python
+tool = monitor.find_tool_by_name("kai-app_getManagedApps")
+await tool.run_async(...)
+```
+
+즉:
+
+| 단계                     | 누가                       |
+| ---------------------- | ------------------------ |
+| tool 호출                | LLM → `mcp_long_running` |
+| 실제 MCP 실행              | proxy 내부                 |
+| wrapping된 kai-app_* 실행 | **LLM 아님**               |
+
+👉 지금 방향이 **정확히 맞습니다**
+
+---
+
+## 5️⃣ LLM이 함수 이름을 부르는 걸 막는 “보험 장치” (강력 추천)
+
+### ✅ Tool name을 함수 이름과 **완전히 다르게**
+
+```python
+mcp_long_running_proxy_tool = LongRunningFunctionTool(
+    name="mcp_long_running",   # 짧고 추상적
+    func=run_mcp_long_running_proxy,
+)
+```
+
+이미 잘 하셨어요 👍
+이 상태에서 **instruction만 깨끗하면 문제 사라집니다.**
+
+---
+
+## 6️⃣ 빠른 점검 체크리스트 (이거 3개만 보면 됨)
+
+* [ ] instruction / description에 `run_mcp_long_running_proxy` 문자열이 없다
+* [ ] LLM이 호출하는 tool name = `mcp_long_running`
+* [ ] 실제 MCP tool 이름(`kai-app_getManagedApps`)은 args로만 전달된다
+
+이 3개면 **100% 해결**
+
+---
+
+## 7️⃣ 한 줄 결론
+
+> **이 에러는 “proxy 설계 문제”가 아니라
+> “LLM에게 Python 함수 이름이 새어나간 프롬프트 문제”다**
+
+지금 구조는 **맞게 짜여 있고**,
+instruction만 정리하면 바로 정상 동작할 겁니다.
+
+---
+
+다음으로 바로 이어서 도와줄 수 있는 건:
+
+* 🔍 **LLM이 tool_name을 잘 고르게 만드는 prompt 패턴**
+* 🧠 **tool_name 후보를 자동으로 알려주는 방법**
+* 🔁 **polling을 LLM이 아니라 코드가 돌게 하는 구조**
+
+어디까지 갈까요?
 
 
-
+------
 
 **지금 네 코드 구조(agent / MCPToolMonitor / long_running_wrapper)** 를 그대로 존중하면서
 
