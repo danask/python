@@ -1,3 +1,111 @@
+
+로그를 분석해 보니 소프트웨어 전문가로서 매우 익숙한 이슈가 발견되었습니다. 이 에러는 **`asyncio.CancelledError`**와 **`RuntimeError: Attempted to exit cancel scope...`**가 결합된 형태입니다.
+
+자바 개발자 관점에서 설명하자면, 이 상황은 **"메인 스레드가 비동기 작업을 기다리다가 타임아웃이나 예외로 인해 연결을 끊었는데(Cancelled), 그 사이에 다른 스레드(Task)가 MCP 도구들을 로드하려고 시도하다가 충돌이 발생"**한 것입니다.
+
+### 1. 원인 분석: 왜 터지는가?
+
+1. **동시성 충돌**: `refresh_agent_tools` 내부에서 `get_tools`를 호출할 때, 내부적으로 `anyio`나 `mcp` 클라이언트가 별도의 Task Group을 만듭니다. 이때 HTTP 연결이 지연되거나 다른 작업이 취소되면 비동기 컨텍스트가 꼬이면서 "자기가 시작한 Scope가 아닌 곳에서 종료하려고 한다"는 `RuntimeError`가 발생합니다.
+2. **부팅 지연 (Startup Latency)**: 에이전트가 실행될 때 도구를 로드하는 과정이 너무 오래 걸려서 `uvicorn`이나 `fastapi`의 요청 처리 타임아웃에 걸렸을 가능성이 큽니다.
+
+### 2. 해결 전략: "Thread-safe하고 고립된 초기화"
+
+이 복잡한 비동기 에러를 피하려면, 도구를 로드하는 로직을 **"최대한 단순하고 고립된 환경"**에서 처리해야 합니다. `asyncio.shield`를 사용하여 작업 취소를 방지하거나, 도구를 가져오는 로직에서 불필요한 비동기 중첩을 제거해야 합니다.
+
+#### **수정된 `agent.py`의 `refresh_agent_tools**`
+
+```python
+import asyncio
+
+async def refresh_agent_tools(agent):
+    """안전하게 도구를 주입하기 위해 shield를 사용하여 취소 방지"""
+    
+    async def _safe_fetch():
+        logger.info("📡 [SAFE-FETCH] MCP Tool discovery started...")
+        
+        # 1. 도구셋 로드 (취소되지 않도록 독자적 실행)
+        mcp_toolsets = get_tools(
+            server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+            allow_list=["get", "get_", "list_", "read_", "check_", "usp_", "kai-"],
+            require_confirmation=False,
+        )
+        
+        new_tools = [
+            convert_timestamp_to_datetime,
+            load_compacted_response,
+            check_mcp_operation_status_tool,
+        ]
+
+        for toolset in mcp_toolsets:
+            try:
+                # [핵심] await 시점에 에러가 날 수 있으므로 try-except로 감쌈
+                if hasattr(toolset, "get_tools"):
+                    actual_tools = await toolset.get_tools()
+                else:
+                    actual_tools = getattr(toolset, "tools", [])
+                
+                for tool in actual_tools:
+                    # 롱러닝 래핑 적용
+                    lr_tool = create_long_running_mcp_tool(toolset, tool.name)
+                    lr_tool.name = f"LR_{tool.name}"
+                    new_tools.append(lr_tool)
+                    logger.info(f"✅ [SUCCESS] Wrapped: {lr_tool.name}")
+            except Exception as e:
+                logger.error(f"❌ [TOOL-ERROR] Failed to load toolset {toolset}: {e}")
+
+        # 기존 에이전트 도구 교체
+        agent.tools = new_tools
+        return len(new_tools)
+
+    # asyncio.shield를 사용하여 HTTP 요청 취소가 도구 로딩 중단으로 이어지지 않게 보호
+    try:
+        count = await asyncio.shield(_safe_fetch())
+        logger.info(f"🚀 [PATCH-COMPLETE] Total {count} tools ready.")
+    except Exception as e:
+        logger.error(f"💥 [FATAL] Tool refresh failed: {e}")
+
+```
+
+### 3. 컨트롤러에서의 안전 장치
+
+컨트롤러에서 `await refresh_agent_tools(agent)`를 호출할 때, 만약 도구 로딩이 실패하더라도 전체 API가 죽지 않도록 방어 로직을 넣어야 합니다.
+
+```python
+# controller.py
+
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    from agents.device_info.agent import get_root_agent, refresh_agent_tools
+    
+    agent = get_root_agent()
+    
+    # 도구 주입 상태 확인
+    is_ready = any(hasattr(t, 'name') and t.name.startswith("LR_") for t in agent.tools)
+    
+    if not is_ready:
+        logger.warning("🛠️ [LAZY-INIT] First-time tool loading...")
+        # 여기서 발생하는 예외가 FastAPI 전체로 퍼지지 않게 처리
+        try:
+            await refresh_agent_tools(agent)
+        except Exception as e:
+            logger.error(f"Failed to refresh tools in controller: {e}")
+
+    # 이후 비즈니스 로직 수행
+    return await _handle_chat_request(...)
+
+```
+
+### 4. 자바 개발자를 위한 핵심 요약
+
+* **문제**: `mcp.client` 내부에서 사용하는 `anyio` TaskGroup이 취소(Cancel) 시그널을 받았는데, 다른 비동기 루틴이 여전히 그 자원을 쓰려고 해서 터진 것입니다.
+* **해결**: `asyncio.shield`는 자바에서 **"새로운 스레드를 생성하여 작업을 위임하고 그 결과만 기다리는 것"**과 비슷하게, 상위 작업이 취소되어도 하위 작업(도구 로드)은 끝까지 완료되도록 보호해 줍니다.
+
+현재 로그를 보면 `34개`까지 업데이트는 되었는데, 그 직후 LLM 호출 단계(`litellm`)에서 취소가 발생한 것으로 보입니다. 위 코드처럼 `shield`를 적용하고 `try-except`로 감싸주면 에러가 전파되어 애플리케이션이 죽는 현상을 막을 수 있습니다.
+
+이 코드를 적용한 후 다시 한 번 테스트해 보시겠어요? 이번에는 `ERROR: Exception in ASGI application` 없이 깔끔하게 통과될 것입니다.
+
+-----
+
 네, 코드를 보니 이제 상황이 명확해졌습니다! 자바 개발자 입장에서 이 구조는 **`Factory` 패턴**입니다. `create_agent()`라는 팩토리 메서드가 호출될 때 에이전트 객체가 비로소 생성되는 구조군요.
 
 그런데 문제는 **이 팩토리 메서드가 "언제" 호출되느냐**입니다. 보통 ADK 프레임워크는 서버가 뜰 때 이 함수를 한 번 호출해서 에이전트 인스턴스를 만듭니다. 하지만 그때 MCP 서버가 준비 안 되어 있으면 도구가 0개인 에이전트가 만들어지겠죠.
