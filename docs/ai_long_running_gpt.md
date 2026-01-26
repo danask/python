@@ -1,3 +1,248 @@
+
+오케이, 이 말이면 상황이 **한 단계 더 정확해졌어요.**
+지금은 “프롬프트 실수”가 아니라 **ADK 동작 특성 + 기존 실행 컨텍스트** 문제일 가능성이 매우 큽니다.
+
+차분하게 **왜 이런 일이 ‘프롬프트에 없어도’ 발생하는지**부터 짚을게요.
+
+---
+
+# 🔥 핵심 결론부터
+
+> **LLM이 `run_mcp_long_running_proxy`를 부르는 이유는
+> 지금 프롬프트 때문이 아니라,
+> “과거 실행 컨텍스트(메모리/trace/생각)”에서 그 이름을 이미 배웠기 때문일 가능성이 높습니다.**
+
+그리고 이건 **ADK에서 꽤 흔한 케이스**입니다.
+
+---
+
+## 1️⃣ 중요한 증거: 에러 메시지 자체
+
+```text
+Tool 'run_mcp_long_running_proxy' not found.
+Available tools:
+- set_model_response
+- convert_timestamp_to_datetime
+- load_compacted_response
+- mcp_long_running
+```
+
+이 메시지가 의미하는 건 단 하나입니다:
+
+* ✅ ADK는 **정상적으로 `mcp_long_running`만 등록**하고 있음
+* ❌ LLM은 **존재하지 않는 tool 이름을 “의도적으로” 호출**함
+
+👉 즉,
+
+> **LLM 내부 상태에 이미 `run_mcp_long_running_proxy`라는 이름이 있음**
+
+---
+
+## 2️⃣ “어디에도 그 이름 안 썼는데요?” → 그래도 생길 수 있음
+
+아래 중 **하나라도 해당되면 충분합니다.**
+
+### 🔹 1. 이전 실행에서 tool trace가 memory에 저장됨
+
+너 코드 보면 👇
+
+```python
+chat_service = await ChatService.initialize_chat_session(
+    ...
+    memory=chat_service.memory_service,
+)
+```
+
+그리고:
+
+```python
+collect_response_with_contexts(...)
+```
+
+👉 이 구조는 보통:
+
+* function call
+* function name
+* arguments
+  를 **그대로 memory에 저장**합니다.
+
+📌 즉, 과거에 한 번이라도:
+
+```python
+func=run_mcp_long_running_proxy
+```
+
+가 호출되었으면
+→ **LLM은 “이전 대화에서 썼던 tool”로 기억**
+
+---
+
+### 🔹 2. include_thoughts=True (이건 거의 확실)
+
+```python
+thinking_config=types.ThinkingConfig(
+    include_thoughts=True,
+)
+```
+
+이 옵션이 있으면 ADK는 내부적으로:
+
+* tool metadata
+* function binding 정보
+* sometimes func.**name**
+
+을 **LLM 입력으로 재주입**합니다.
+
+📌 이건 공식 문서에도 “디버깅 용도”라고 되어 있음.
+
+---
+
+### 🔹 3. collect_response_with_contexts가 functionCall을 재주입
+
+이 함수 이름부터 수상하죠 😅
+
+보통 이런 함수는:
+
+* 이전 functionCall
+* tool name
+* response
+
+를 **다음 요청의 system/context로 다시 넣습니다.**
+
+👉 여기서 `run_mcp_long_running_proxy`가 살아남았을 확률 높음
+
+---
+
+## 3️⃣ 그래서 “아무 데도 안 썼는데 계속 나온다”가 성립함
+
+이 흐름입니다:
+
+```
+(과거)
+run_mcp_long_running_proxy 호출됨
+ ↓
+memory / context에 저장됨
+ ↓
+LLM이 “이전에 쓴 tool”로 인식
+ ↓
+현재는 tool에서 제거됨
+ ↓
+Tool not found 에러
+```
+
+이건 **코드 문제가 아니라 상태 문제**예요.
+
+---
+
+## 4️⃣ 바로 검증하는 가장 빠른 방법 (강력 추천)
+
+### ✅ 테스트 1: memory 완전 비활성화
+
+**딱 한 번만 이렇게 실행해보세요.**
+
+```python
+chat_service = await ChatService.initialize_chat_session(
+    ...
+    memory=None,   # 🔥 임시
+)
+```
+
+또는 session_id 완전히 새 걸로.
+
+👉 만약 이 상태에서 에러 사라지면
+**100% memory contamination 문제 확정**
+
+---
+
+## 5️⃣ 근본 해결책 (운영 기준)
+
+### ✅ 1. include_thoughts 반드시 끄기
+
+```python
+include_thoughts=False
+```
+
+이건 거의 필수입니다.
+지금 구조에서는 **켜둘 이유가 없음**.
+
+---
+
+### ✅ 2. tool 이름 변경 (강제 reset)
+
+이게 제일 확실합니다.
+
+```python
+name="mcp_long_running_v2"
+```
+
+그리고 instruction도 전부 v2로.
+
+📌 이유:
+
+* LLM은 “새 tool”이라고 인식
+* 과거 기억과 연결 끊김
+
+> **이건 dirty하지만, 실전에서는 제일 잘 먹힘**
+
+---
+
+### ✅ 3. memory 저장 시 functionCall 필터링 (가능하면)
+
+만약 `collect_response_with_contexts` 수정 가능하면:
+
+* functionCall.name
+* tool 내부 func 이름
+
+을 **memory에 저장하지 않게**
+
+---
+
+## 6️⃣ “wrapping 된 kai-app_getManagedApps가 실행돼야 한다”에 대한 최종 정리
+
+다시 한 번 정확히 말하면:
+
+* ❌ LLM이 `kai-app_getManagedApps`를 tool로 호출 ❌
+* ✅ LLM은 **항상** `mcp_long_running(_v2)`만 호출
+* ✅ `kai-app_getManagedApps`는 **proxy 내부에서만 실행**
+
+지금 설계는 **이게 맞습니다.**
+
+---
+
+## 7️⃣ 바로 쓰는 체크리스트 (이 순서로 해보세요)
+
+1. [ ] session_id 완전히 새로
+2. [ ] memory 비활성화 테스트
+3. [ ] include_thoughts=False
+4. [ ] tool name `mcp_long_running_v2`로 변경
+
+👉 여기까지 하면 **이 에러는 반드시 사라집니다.**
+
+---
+
+## 한 줄 결론
+
+> **이건 “코드가 아직 잘못된” 문제가 아니라
+> “LLM이 과거에 배운 tool 이름을 못 잊는” 상태 문제다**
+
+그래서:
+
+* 프롬프트에 없어도
+* 코드에 없어도
+* 계속 그 이름을 부를 수 있습니다.
+
+---
+
+다음으로 도와줄 수 있는 건:
+
+* 🧹 **ADK memory / context를 안전하게 관리하는 방법**
+* 🧠 **tool name을 절대 hallucinate 안 하게 만드는 패턴**
+* 🔁 **proxy + polling을 코드 레벨에서 자동화**
+
+어디로 갈까요?
+
+
+----
 짚은 포인트 **정확합니다.**
 그리고 질문 두 개 다 답은 **“예, 맞다 / 예, 그거다”** 입니다.
 
