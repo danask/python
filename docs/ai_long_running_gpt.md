@@ -1,3 +1,234 @@
+짚은 포인트 **정확합니다.**
+그리고 질문 두 개 다 답은 **“예, 맞다 / 예, 그거다”** 입니다.
+
+---
+
+## 1️⃣ “전에 이거 때문에 그런 거 아냐?” → **네, 거의 100% 맞습니다**
+
+지금 이 정의 자체는 **틀리지 않았는데**,
+**ADK + LLM 조합에서는 아주 흔한 부작용**을 일으킵니다 👇
+
+```python
+mcp_long_running_proxy_tool = LongRunningFunctionTool(
+    name="mcp_long_running",
+    func=run_mcp_long_running_proxy,
+    description=""" ... """,
+)
+```
+
+### 문제의 핵심은 이 줄이 아닙니다
+
+```python
+func=run_mcp_long_running_proxy
+```
+
+**문제는 이 함수 이름이 “LLM이 볼 수 있는 컨텍스트로 새어나갔을 가능성”**이에요.
+
+ADK는:
+
+* tool name → LLM에게 “이걸 호출해라”
+* func → 내부 바인딩
+
+이론상 func 이름은 LLM이 몰라야 합니다.
+**하지만 실제로는** 아래 중 하나만 있어도 노출됩니다:
+
+* 디버그 로그를 system prompt에 합침
+* tool 설명/에러를 그대로 LLM에게 전달
+* function call trace를 그대로 memory에 저장
+* `include_thoughts=True` + tool metadata 노출
+
+👉 그 결과 LLM이:
+
+```
+"아, run_mcp_long_running_proxy 라는 함수가 있네?"
+```
+
+라고 학습해버립니다.
+
+---
+
+## 2️⃣ 그래서 LLM이 이렇게 호출한 겁니다
+
+```
+functionCall.name = "run_mcp_long_running_proxy"
+```
+
+하지만 ADK는:
+
+```
+등록된 tool name = mcp_long_running
+```
+
+👉 그래서 정확히 이 에러가 난 겁니다:
+
+```
+Tool 'run_mcp_long_running_proxy' not found
+```
+
+---
+
+## 3️⃣ “instruction 이라고 함은 prompt 를 말하는 거지?”
+
+### ✅ 네. 정확히 말하면:
+
+> **Agent 생성 시 넣는 `instruction` = system prompt**
+
+즉 이 부분 👇
+
+```python
+return Agent(
+    ...
+    instruction=(f"{INSTRUCTION}\n ..."),
+    ...
+)
+```
+
+여기 들어가는 **모든 텍스트가 LLM의 행동을 결정**합니다.
+
+---
+
+## 4️⃣ 그래서 지금 반드시 해야 할 조치 (중요도 순)
+
+### 🔥 1. instruction에서 “func 이름 완전 차단”
+
+아래 문구 **절대 들어가면 안 됩니다**:
+
+* `run_mcp_long_running_proxy`
+* `run_*`
+* Python 함수명 형태
+
+### ✅ 안전한 instruction 템플릿 (이대로 써도 됨)
+
+```text
+You can use a tool named `mcp_long_running`.
+
+This is the ONLY tool used to execute MCP tools.
+
+Usage:
+- Call `mcp_long_running`
+- Provide:
+  - tool_name (string)
+  - tool_args (object)
+
+Never invent tool names.
+Never call internal functions.
+```
+
+---
+
+### 🔥 2. description도 “func 이름 추론 불가”하게
+
+지금 description은 거의 괜찮은데, **한 줄만 더 보수적으로** 가세요:
+
+```python
+description="""
+Run an MCP tool as a long-running operation.
+
+Arguments:
+- tool_name: exact MCP tool name
+- tool_args: arguments for that tool
+
+Returns an operation_id.
+"""
+```
+
+> “proxy”, “wrapper”, “function” 같은 단어도 가능하면 빼는 게 좋습니다.
+
+---
+
+### 🔥 3. include_thoughts=True → 강력 경고
+
+이 설정 👇
+
+```python
+planner=BuiltInPlanner(
+    thinking_config=types.ThinkingConfig(
+        include_thoughts=True,
+    ),
+)
+```
+
+이게 있으면:
+
+* 내부 추론
+* tool metadata
+* 함수명
+
+이 **생각보다 많이 LLM 컨텍스트로 유입**됩니다.
+
+👉 **문제 원인 중 하나일 확률 높음**
+
+#### 권장
+
+```python
+include_thoughts=False
+```
+
+(디버깅 끝나면 꼭 끄세요)
+
+---
+
+## 5️⃣ 이게 왜 “instruction 문제”냐면 (개념 정리)
+
+* ADK에서 tool 선택은 **pure prompt-driven**
+* Python 코드 → 실행 엔진
+* instruction / description → **LLM 세계의 진실**
+
+LLM은:
+
+> “instruction + description에 나온 이름만이 ‘존재하는 tool’이다”
+
+라고 믿습니다.
+
+---
+
+## 6️⃣ 마지막으로, 지금 상태에서의 “정확한 기대 동작”
+
+LLM이 **절대 하면 안 되는 것**
+
+```
+functionCall.name = "run_mcp_long_running_proxy" ❌
+```
+
+LLM이 **반드시 해야 하는 것**
+
+```json
+{
+  "name": "mcp_long_running",
+  "args": {
+    "tool_name": "kai-app_getManagedApps",
+    "tool_args": {...}
+  }
+}
+```
+
+---
+
+## 7️⃣ 한 줄 결론
+
+> **네, 그 코드 때문에 시작됐고
+> 근본 원인은 “instruction(system prompt)에 Python 함수 이름이 새어 나간 것”입니다.**
+
+지금 구조는 맞고,
+
+* instruction 정리
+* description 최소화
+* include_thoughts 끄기
+
+이 3가지만 하면 이 에러는 사라집니다.
+
+---
+
+다음으로 바로 보면 좋은 건:
+
+* 🔍 **tool_name을 hallucinate 안 하게 만드는 방법**
+* 📜 **MCP tool 목록을 LLM에게 안전하게 알려주는 법**
+* 🔁 **polling을 LLM이 아니라 코드가 처리하는 구조**
+
+어디 갈까요?
+
+
+-----
 
 아주 좋은 로그 가져오셨어요. 이 에러는 **구조를 잘못 짠 게 아니라, 딱 “한 군데”가 어긋난 전형적인 ADK 함정**입니다.
 차분하게 짚어볼게요.
