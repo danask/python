@@ -1,4 +1,104 @@
 
+자바 개발자로서 느끼시기에 현재 방식이 복잡하고 꼬이는 이유는, 파이썬의 **Import 타임(컴파일 타임과 유사)**과 **Runtime(비동기 루프 실행 시점)**이 섞여서 그렇습니다. 특히 `root_agent`가 생성되기도 전에 다른 곳에서 참조하려니 `Dependency` 문제가 발생하는 것이죠.
+
+가장 깔끔하고 자바스러운 해결책은 **"에이전트 객체는 미리 만들어두되, 도구(Tools)만 나중에 갈아끼우는(Hot-swap)"** 방식입니다. 이렇게 하면 `app.py`나 `__init__.py`에서 `root_agent.name`을 참조할 때 에러가 나지 않습니다.
+
+---
+
+### 💡 새로운 전략: "빈 껍데기 선언 후 도구만 주입"
+
+이 방식은 자바의 **Setter 주입**이나 **Proxy 패턴**과 비슷합니다.
+
+#### 1. `agent.py`: 에이전트를 즉시 생성 (도구 없이)
+
+서버 부팅 시점에 `root_agent`를 즉시 만듭니다. 이때 도구 리스트는 비워두거나 기본 도구만 넣습니다. 이렇게 하면 `app = App(name=root_agent.name)`에서 에러가 나지 않습니다.
+
+```python
+# agents/device_info/agent.py
+
+# 1. 일단 에이전트 객체부터 생성 (name, description 등 고정값 확보)
+root_agent = Agent(
+    model=BEDROCK_AI_MODEL,
+    name="device_info",
+    description="Device Information Agent",
+    tools=[convert_timestamp_to_datetime], # 최소한의 도구만
+    instruction=INSTRUCTION,
+    # ... 나머지 설정
+)
+
+app = App(name=root_agent.name, description=root_agent.description)
+
+# 2. 나중에 호출할 '도구 업데이트' 함수
+async def refresh_agent_tools():
+    """부팅 후 실제 MCP 도구를 가져와서 래핑한 뒤 주입함"""
+    logger.info("🔄 [POST-PROCESS] Starting Tool Injection...")
+    
+    # MCP 도구 가져오기 (비동기)
+    mcp_toolsets = get_tools(...) 
+    
+    new_tools = [convert_timestamp_to_datetime, load_compacted_response, check_mcp_operation_status_tool]
+    
+    for toolset in mcp_toolsets:
+        actual_tools = await toolset.get_tools() if hasattr(toolset, "get_tools") else getattr(toolset, "tools", [])
+        for tool in actual_tools:
+            if is_long_running(tool.name):
+                # LR_ 접두어 붙여서 래핑
+                wrapped = create_long_running_mcp_tool(toolset, tool.name)
+                wrapped.name = f"LR_{tool.name}"
+                new_tools.append(wrapped)
+            else:
+                new_tools.append(tool)
+
+    # [핵심] 이미 생성된 에이전트의 도구함만 갈아끼움 (Hot-swap)
+    root_agent.tools = new_tools
+    logger.info(f"✅ [POST-PROCESS] Injected {len(new_tools)} tools into root_agent.")
+
+```
+
+#### 2. `__init__.py`: 간단하게 유지
+
+이미 객체들이 생성되어 있으므로 그냥 노출만 하면 됩니다.
+
+```python
+# agents/device_info/__init__.py
+__all__ = ["root_agent", "app", "refresh_agent_tools"]
+
+from .agent import root_agent, app, refresh_agent_tools
+
+```
+
+#### 3. `controller.py`: 첫 요청 시 딱 한 번만 수행 (Lazy Load)
+
+컨트롤러가 호출될 때 도구가 비어있다면(`LR_` 도구가 없다면) 그때 업데이트를 실행합니다.
+
+```python
+# controller.py
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    # LR_ 도구가 아직 등록 안 되었다면 (자바의 Singleton Lazy Init 패턴)
+    if not any(t.name.startswith("LR_") for t in root_agent.tools):
+        await refresh_agent_tools()
+    
+    return await _handle_chat_request(...)
+
+```
+
+---
+
+### 이 방식이 왜 더 좋은가요?
+
+1. **참조 에러 해결**: `root_agent`와 `app` 객체가 부팅 즉시(Import 타임) 생성되므로 `NoneType` 에러가 원천 봉쇄됩니다.
+2. **구조 단순화**: `init_agent`라는 거창한 비동기 생성 함수를 만들 필요 없이, 기존 객체의 **속성(Property)**만 나중에 채워주면 됩니다.
+3. **가시성 확보**: `refresh_agent_tools`가 실행될 때 터미널 로그에 `Wrapped: LR_...`가 찍히는 것을 보며 래퍼가 잘 작동하는지 바로 확인할 수 있습니다.
+
+### **전문가의 마지막 팁**
+
+자바에서 가변 리스트를 다루듯, 파이썬에서도 `root_agent.tools = new_tools`라고 대입하는 순간 에이전트는 즉시 새로운 도구들을 사용하기 시작합니다.
+
+이제 복잡한 비동기 초기화 순서 때문에 골머리 썩으실 필요 없습니다. 이 **"객체 선언 후 도구 주입"** 방식으로 가시죠. 지금 바로 `agent.py`에서 `root_agent`를 먼저 생성하도록 수정해 보시겠어요? 다음 단계는 제가 도와드리겠습니다.
+
+----
+
 자바 개발자 관점에서 이 에러는 **`NullPointerException`**과 정확히 같은 상황입니다.
 
 `app.py`가 실행되는 시점(Import 타임)에는 아직 `init_agent()`가 호출되지 않았기 때문에 `root_agent`는 `None`인 상태입니다. 자바로 치면 **초기화되지 않은 정적 변수의 필드에 접근**하려다 터지는 것이죠.
