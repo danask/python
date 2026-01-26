@@ -1,3 +1,114 @@
+소프트웨어 전문가로서 분석해 본 결과, 현재 상황은 **"도구는 불러왔지만, 에이전트 객체 내부의 도구 리스트(tools)가 실제로는 교체되지 않았거나, 래퍼(Wrapper)가 원본 도구를 덮어쓰지 못한 상태"**입니다.
+
+`monitor.log_summary()`를 통해 컨트롤러 시작 전 터미널에서 즉시 확인하고, 롱러닝 래퍼가 확실히 적용되도록 강제하는 최종 개선안을 드립니다.
+
+---
+
+### 1. `MCPToolMonitor`에서 변환 여부 확인하기
+
+`monitor.summary()` 호출 시, 단순히 개수만 보여주지 말고 **이름 앞에 `LR_`이 붙은 도구가 몇 개인지** 로그에 찍히도록 `mcp_tool_monitor.py` (또는 관련 로직)를 수정해야 합니다.
+
+```python
+# mcp_tool_monitor.py 또는 체크 로직에 추가
+def log_summary(self):
+    total = len(self.tools)
+    # 현재 등록된 도구 중 LR_ 접두어가 붙은 것들 카운트
+    lr_tools = [t.name for t in self.tools if t.name.startswith("LR_")]
+    
+    logger.info("="*50)
+    logger.info(f"📊 MCP TOOL MONITOR SUMMARY")
+    logger.info(f" - Total Tools: {total}")
+    logger.info(f" - Long-Running Tools (LR_): {len(lr_tools)}")
+    if lr_tools:
+        logger.info(f" - LR Tool List: {', '.join(lr_tools)}")
+    else:
+        logger.warning(" ⚠️ WARNING: No 'LR_' prefixed tools found!")
+    logger.info("="*50)
+
+```
+
+---
+
+### 2. `agent.py` 수정: 포스트 프로세싱 강제 적용
+
+사용자님이 말씀하신 "다시 조회 시 31개"가 뜬다는 것은 `rediscover_tools`가 작동했다는 뜻입니다. 이때 **에이전트의 `tools` 속성을 직접 갈아끼워야 합니다.**
+
+```python
+# agent.py 개선본
+
+async def check_mcp_tools_status():
+    """MCP 도구 상태를 체크하고, 발견된 도구들을 LR로 변환하여 에이전트에 주입"""
+    monitor = get_tool_monitor()
+    # 1. 최신 도구 리스트 확보 (여기서 28개를 가져옴)
+    await monitor.rediscover_tools() 
+    
+    # 2. 래퍼 적용 및 에이전트 도구 교체
+    all_mcp_toolsets = monitor.toolsets # rediscover 이후의 최신 툴셋
+    long_running_patterns = ["get_", "list_", "usage", "report", "kai-"]
+    
+    # 기본 툴은 유지
+    updated_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool
+    ]
+
+    for toolset in all_mcp_toolsets:
+        for tool in getattr(toolset, "tools", []):
+            # 패턴 매칭 시 LR_ 접두어 붙여서 래핑
+            if any(p in tool.name.lower() for p in long_running_patterns):
+                lr_name = f"LR_{tool.name}"
+                wrapped = create_long_running_mcp_tool(
+                    toolset, 
+                    tool.name, 
+                    agent_tool_name=lr_name # 이 이름이 로그에 찍힘
+                )
+                updated_tools.append(wrapped)
+            else:
+                updated_tools.append(tool)
+
+    # [가장 중요] 글로벌 에이전트 객체의 도구 리스트를 강제로 업데이트
+    root_agent.tools = updated_tools
+    
+    logger.info(f"🚀 [POST-PROCESS] Agent tools synchronized. Total: {len(updated_tools)}")
+    monitor.log_summary() # 위에서 만든 요약 로그 출력
+    
+    return {"total": len(updated_tools), "lr_count": len([t for t in updated_tools if hasattr(t, 'name') and t.name.startswith("LR_")])}
+
+```
+
+---
+
+### 3. 컨트롤러에서 로그 확인 절차
+
+`chat-device-info`가 불리기 전에 `check_mcp_tools_status()`가 비동기로 완료되어야 합니다.
+
+```python
+# controller.py
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    # 요청마다 체크하거나, 서버 부팅 후 최초 1회 확실히 수행
+    status = await check_mcp_tools_status()
+    logger.info(f"Current Agent Tool Status: {status}")
+    
+    # 이제 에이전트는 LR_ 접두어가 붙은 도구만 알고 있습니다.
+
+```
+
+---
+
+### 4. 왜 이전에는 LR 로그가 안 떴을까? (원인 분석)
+
+1. **객체 참조 분리:** `Agent`를 생성할 때 전달한 `tools` 리스트는 리스트의 **복사본**일 수 있습니다. 나중에 외부에서 `long_running_tools` 리스트에 append 해도 에이전트 내부의 리스트에는 반영되지 않습니다. 반드시 `root_agent.tools = new_list` 처럼 직접 할당해야 합니다.
+2. **이름 중복:** 만약 `LR_`을 붙이지 않고 원본 이름 그대로 래핑했다면, 에이전트는 기존에 알고 있던(래핑 안 된) 도구를 계속 사용할 수 있습니다. 접두어를 붙이면 에이전트가 "아, 이제는 `LR_...` 이걸 써야 하는구나"라고 확실히 인지합니다.
+
+### **전문가의 최종 제언**
+
+지금 바로 `check_mcp_tools_status` 함수 끝에 `print([t.name for t in root_agent.tools])`를 넣어보세요. 출력된 리스트에 `LR_`로 시작하는 이름들이 있다면 성공입니다. 만약 없다면 `create_long_running_mcp_tool` 내부에서 `tool.name`이 제대로 설정되지 않는 것이니 그 부분을 다시 점검해야 합니다.
+
+이제 `LR_` 접두어가 로그에 찍히는지 확인해 보시겠어요? 가시성이 확보되면 디버깅이 훨씬 빨라집니다.
+
+
 소프트웨어 전문가로서 정확한 진단을 내리셨습니다. MCP 서버는 별도의 프로세스로 구동되기 때문에, 에이전트가 실행되는 시점(Import 또는 구동 직후)에 `get_tools`를 호출하면 서버와의 핸드쉐이크가 완료되지 않아 도구 목록이 비어 있는 경우가 많습니다.
 
 이를 해결하기 위해 에이전트 생성 후 도구를 나중에 채워넣는 **포스트 프로세싱(Post-processing)** 또는 **지연 초기화(Lazy Initialization)** 방식이 실무에서 훨씬 안정적입니다.
