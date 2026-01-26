@@ -1,3 +1,123 @@
+소프트웨어 전문가로서 분석해 본 결과, `refresh_agent_tools` 함수 내에서 `get_tools`를 호출했을 때 값이 없는 이유는 **`get_tools` 함수가 비동기(Async) 방식으로 동작해야 함에도 불구하고 동기 방식으로 호출되었거나, 내부적으로 사용 중인 `McpToolset` 객체들이 아직 서버로부터 도구 목록을 수신(Fetch)하지 못한 상태**이기 때문입니다.
+
+특히 제공해주신 `agent.py` 코드를 보면, `get_tools`가 반환하는 `toolset` 내부에 `tools` 속성이 없을 경우를 대비해 `asyncio.run(current_toolset.get_tools())`를 사용하는 복잡한 로직이 이미 포함되어 있습니다. 이는 MCP 도구 로딩이 단순히 함수 호출 한 번으로 끝나는 게 아니라 네트워크 통신이 필요한 비동기 작업임을 의미합니다.
+
+이 문제를 해결하고, 컨트롤러 시작 전 터미널에서 확실히 상태를 확인할 수 있는 개선된 포스트 프로세싱 코드를 제안합니다.
+
+### 1. 포스트 프로세싱 코드 개선 (비동기 처리 강화)
+
+`get_tools`가 반환한 `toolset`들이 실제로 도구를 가지고 있는지 확인하기 위해 `await`를 명시적으로 사용해야 합니다. 또한, 에이전트의 `tools`를 교체할 때 **이름(name) 속성이 확실히 부여된 래퍼**가 들어가도록 보정합니다.
+
+```python
+# agent.py 내부에 수정 적용
+async def refresh_agent_tools():
+    """포스트 프로세싱: 비동기적으로 도구를 다시 읽어와 LR 접두어를 붙여 갱신"""
+    global root_agent
+    
+    allow_list = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+    long_running_patterns = ["get_", "list_", "usage", "report", "kai-"]
+
+    # 1. MCP 도구셋 가져오기
+    mcp_toolsets = get_tools(
+        server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+        allow_list=allow_list,
+        require_confirmation=False,
+    )
+
+    new_final_tools = [
+        convert_timestamp_to_datetime, 
+        load_compacted_response, 
+        check_mcp_operation_status_tool
+    ]
+    
+    found_any = False
+    
+    for toolset in mcp_toolsets:
+        # [중요] 비동기적으로 도구 목록을 가져와야 할 수 있음
+        actual_tools = []
+        if hasattr(toolset, "get_tools"):
+            # McpToolset의 도구를 비동기로 명시적 획득
+            actual_tools = await toolset.get_tools() 
+        elif hasattr(toolset, "tools"):
+            actual_tools = toolset.tools
+
+        if not actual_tools:
+            logger.warning(f"⚠️ [POST-PROCESS] Toolset {type(toolset).__name__} has no tools yet.")
+            continue
+
+        for tool in actual_tools:
+            found_any = True
+            tool_name = tool.name
+            
+            # 롱러닝 대상 여부 확인
+            is_lr = any(p in tool_name.lower() for p in long_running_patterns)
+            
+            if is_lr:
+                lr_display_name = f"LR_{tool_name}"
+                # [수정] 래퍼 생성 시 에이전트용 이름을 인자로 전달 (wrapper 코드 수정 필요)
+                wrapped_tool = create_long_running_mcp_tool(
+                    toolset, 
+                    tool_name,
+                    # 만약 wrapper가 agent_tool_name을 지원하지 않는다면 아래 '3번' 참고
+                )
+                # 에이전트 인식용 이름 강제 부여
+                wrapped_tool.name = lr_display_name 
+                new_final_tools.append(wrapped_tool)
+                logger.info(f"✅ [POST-PROCESS] Wrapped: {lr_display_name}")
+            else:
+                new_final_tools.append(tool)
+
+    if found_any:
+        # [핵심] 에이전트 객체의 도구 리스트를 강제로 교체
+        root_agent.tools = new_final_tools
+        logger.info(f"🚀 [POST-PROCESS] Agent tools updated. Total: {len(new_final_tools)}")
+    
+    return found_any
+
+```
+
+### 2. 컨트롤러 시작 전 터미널에서 확인하는 방법
+
+서버가 실행될 때(Controller가 요청을 받기 전) 도구가 정상적으로 변환되었는지 확인하려면, `agent.py` 맨 하단에 **백그라운드 초기화 루프**를 돌리는 것이 가장 효과적입니다.
+
+```python
+# agent.py 최하단에 추가
+import asyncio
+import threading
+
+def run_post_init():
+    """별도 스레드에서 도구가 로드될 때까지 재시도하며 상태를 로그에 출력"""
+    async def _init():
+        max_retries = 5
+        for i in range(max_retries):
+            logger.info(f"🔄 [MONITOR] Attempting tool synchronization (Attempt {i+1}/{max_retries})...")
+            success = await refresh_agent_tools()
+            if success:
+                # 성공 시 현재 에이전트가 가진 도구 이름을 모두 출력
+                names = [getattr(t, 'name', str(t)) for t in root_agent.tools]
+                logger.info(f"📊 [MONITOR] Final Tool List: {names}")
+                break
+            await asyncio.sleep(2) # MCP 서버 응답 대기 시간
+
+    # 새 루프에서 실행 (메인 루프와 충돌 방지)
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_until_complete, args=(_init(),), daemon=True).start()
+
+# 에이전트 생성 직후 실행
+run_post_init()
+
+```
+
+### 3. 왜 `LR_` 관련 로그가 안 뜰까? (점검 포인트)
+
+1. **변수 스코프 문제**: `Agent` 생성 시 전달된 `tools` 리스트는 내부적으로 튜플이나 복사된 리스트로 저장될 수 있습니다. `root_agent.tools = new_tools`와 같이 **인스턴스 속성에 직접 재할당**하지 않으면 에이전트는 계속 예전 도구 리스트를 참조합니다.
+2. **도구 이름 속성 누락**: `LongRunningFunctionTool` 객체가 생성된 후 `.name` 속성에 `LR_...` 값이 할당되지 않으면, 에이전트의 로그 시스템(`BuiltInPlanner`)은 원본 함수 이름이나 래퍼의 공통 이름을 출력하게 됩니다.
+3. **패턴 매칭 실패**: `long_running_patterns`에 포함된 문자열이 실제 MCP 도구 이름과 대소문자까지 정확히 맞는지 확인해야 합니다 (`tool_name.lower()` 사용 권장).
+
+**정리:** `refresh_agent_tools` 내부에서 `await toolset.get_tools()`를 호출하여 실제 도구 데이터를 확보한 뒤, `root_agent.tools`에 직접 재할당하는 로직을 적용해 보세요. 그러면 컨트롤러 호출 전 터미널 로그에서 `✅ [POST-PROCESS] Wrapped: LR_...` 메시지를 보실 수 있을 것입니다.
+
+-----
+
 소프트웨어 전문가로서 분석해 본 결과, 현재 상황은 **"도구는 불러왔지만, 에이전트 객체 내부의 도구 리스트(tools)가 실제로는 교체되지 않았거나, 래퍼(Wrapper)가 원본 도구를 덮어쓰지 못한 상태"**입니다.
 
 `monitor.log_summary()`를 통해 컨트롤러 시작 전 터미널에서 즉시 확인하고, 롱러닝 래퍼가 확실히 적용되도록 강제하는 최종 개선안을 드립니다.
