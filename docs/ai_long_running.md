@@ -1,3 +1,105 @@
+네, 코드를 보니 이제 상황이 명확해졌습니다! 자바 개발자 입장에서 이 구조는 **`Factory` 패턴**입니다. `create_agent()`라는 팩토리 메서드가 호출될 때 에이전트 객체가 비로소 생성되는 구조군요.
+
+그런데 문제는 **이 팩토리 메서드가 "언제" 호출되느냐**입니다. 보통 ADK 프레임워크는 서버가 뜰 때 이 함수를 한 번 호출해서 에이전트 인스턴스를 만듭니다. 하지만 그때 MCP 서버가 준비 안 되어 있으면 도구가 0개인 에이전트가 만들어지겠죠.
+
+자바의 **"지연 주입(Lazy Injection)"** 개념을 도입해서, 기존 코드를 최소한으로 수정하면서 목적을 달성하는 전문가급 가이드를 드립니다.
+
+---
+
+### 1. `agent.py` 수정: "부팅 시 한 번, 요청 시 필요하면 다시"
+
+기존 `create_agent` 함수는 유지하되, 외부에 **`root_agent`**라는 싱글톤(Singleton) 변수를 두고 관리하는 방식입니다.
+
+```python
+# 전역 변수 (Java의 static 인스턴스 변수)
+_root_agent = None
+
+def get_root_agent():
+    """싱글톤 에이전트 객체 반환"""
+    global _root_agent
+    if _root_agent is None:
+        _root_agent = create_agent()
+    return _root_agent
+
+def create_agent():
+    # ... (기존 create_agent 코드 그대로 유지) ...
+    # 단, 여기서 반환된 에이전트는 부팅 직후라 도구가 없을 수 있음
+    agent_instance = Agent(...)
+    return agent_instance
+
+async def refresh_agent_tools(agent):
+    """실제로 도구를 긁어와서 이미 만들어진 에이전트 객체에 '박아넣는' 함수"""
+    logger.info("📡 [POST-PROCESS] Fetching tools from MCP servers...")
+    
+    # 1. 비동기로 도구 로드
+    mcp_toolsets = get_tools(...) # 기존 로직 활용
+    
+    new_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    for toolset in mcp_toolsets:
+        # 이 부분이 핵심: await를 써서 비동기로 확실히 가져옵니다.
+        actual_tools = await toolset.get_tools() if hasattr(toolset, "get_tools") else getattr(toolset, "tools", [])
+        
+        for tool in actual_tools:
+            # 롱러닝 래핑 적용
+            lr_tool = create_long_running_mcp_tool(toolset, tool.name)
+            # [수정] 자바 개발자님이 원하신 대로 이름을 다르게 찍히게 설정!
+            lr_tool.name = f"LR_{tool.name}" 
+            new_tools.append(lr_tool)
+
+    # 2. 기존 에이전트 객체의 tools 속성을 Hot-swap
+    agent.tools = new_tools
+    logger.info(f"🚀 [SUCCESS] Injected {len(new_tools)} tools. LR_ tools are ready.")
+
+```
+
+---
+
+### 2. `controller.py`: 사용 시점에 체크 (Java Interceptor 느낌)
+
+컨트롤러에서는 에이전트를 부르기 전에 **"너 도구 세팅 됐니?"**라고 물어보기만 하면 됩니다.
+
+```python
+# controller.py
+from agents.device_info.agent import get_root_agent, refresh_agent_tools
+
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    # 1. 이미 만들어진 싱글톤 에이전트 가져오기
+    agent = get_root_agent()
+    
+    # 2. 도구함에 LR_로 시작하는 툴이 하나도 없다면 (세팅이 안 된 상태라면)
+    if not any(hasattr(t, 'name') and t.name.startswith("LR_") for t in agent.tools):
+        # 비동기로 도구 주입 실행 (자바의 Lazy Initialization)
+        await refresh_agent_tools(agent)
+    
+    # 3. 이제 도구가 꽉 찬 에이전트로 작업 수행
+    return await _handle_chat_request(
+        agent=agent, # 프레임워크에 따라 agent_name 대신 객체를 직접 넘길 수도 있음
+        ...
+    )
+
+```
+
+---
+
+### 3. 왜 이렇게 해야 꼬이지 않을까요?
+
+1. **객체 재활용**: `Agent(...)`를 매번 새로 만들면 메모리 낭비와 설정 충돌이 생기지만, 이 방식은 **한 번 만든 객체의 `tools` 리스트만 교체**하므로 안전합니다.
+2. **이름 가시성**: `lr_tool.name = f"LR_{tool.name}"` 코드가 드디어 들어갔으므로, 이제 로그를 보시면 `Calling tool: LR_kai-app_getAppUsageList`라고 명확하게 찍힐 겁니다.
+3. **컴파일 에러 방지**: `app = App(name=root_agent.name)` 같은 부분은 부팅 시 `create_agent()`가 이미 객체를 반환하므로 `NoneType` 에러 없이 통과됩니다.
+
+### **전문가의 최종 팁**
+
+자바에서 `List`를 필드로 가진 객체가 있을 때, 외부에서 `setTools(newList)`를 호출하는 것과 파이썬의 `agent.tools = new_tools`는 완전히 동일하게 동작합니다.
+
+이제 **"처음 부팅할 때는 빈 껍데기 에이전트만 만들고, 실제 API 호출이 들어올 때 비동기로 도구를 꽉 채워주는"** 이 전략으로 가시면 절대 꼬이지 않습니다. 바로 적용해 보시겠어요? 결과 로그에 `LR_`이 찍히면 성공입니다!
+
+-----
 
 자바 개발자로서 느끼시기에 현재 방식이 복잡하고 꼬이는 이유는, 파이썬의 **Import 타임(컴파일 타임과 유사)**과 **Runtime(비동기 루프 실행 시점)**이 섞여서 그렇습니다. 특히 `root_agent`가 생성되기도 전에 다른 곳에서 참조하려니 `Dependency` 문제가 발생하는 것이죠.
 
