@@ -1,4 +1,89 @@
 
+자바 개발자이신 사용자님께 익숙한 개념으로 설명해 드리면, `__init__.py`는 자바의 **`package-info.java`** 또는 **패키지 레벨의 인터페이스 정의**와 매우 유사합니다. 해당 패키지를 `import` 할 때 무엇을 밖으로 노출할지 결정하는 통제실 역할을 하죠.
+
+현재 상황에서 **비동기 초기화(Async Init)**를 적용하면서 `__init__.py`의 `__all__` 설정을 유지하는 가장 표준적인 방법은 다음과 같습니다.
+
+---
+
+### 1. `__init__.py` 구조 (자바의 Public Interface)
+
+여기서는 `root_agent`가 나중에 채워질 "빈 그릇"임을 선언해 둡니다.
+
+```python
+# agents/device_info/__init__.py
+
+# 외부에서 'from agents.device_info import *' 했을 때 가져갈 수 있는 목록
+__all__ = ["root_agent", "app", "init_agent"]
+
+# 실제 객체는 agent.py에서 관리하므로 이를 가져와서 노출시킵니다.
+from agents.device_info.agent import app, root_agent, init_agent
+
+```
+
+---
+
+### 2. `agent.py` 수정 (실제 구현체 및 비동기 로직)
+
+자바에서 `private static RootAgent instance;`를 선언하고 별도의 `init()` 메서드로 생성하는 것과 같은 원리입니다.
+
+```python
+# agents/device_info/agent.py
+
+# 1. 처음엔 None으로 선언 (자바의 null)
+root_agent = None
+app = device_info_app 
+
+async def init_agent():
+    """비동기적으로 MCP 도구를 래핑하고 root_agent를 생성함"""
+    global root_agent
+    
+    logger.info("📡 [BOOT] Starting Async Initialization...")
+    
+    # 이전에 만든 비동기 에이전트 생성 함수 호출
+    # (이미 이 안에서 LR_ 접두어 처리 및 31개 툴 로드 로직이 포함됨)
+    root_agent = await create_agent_async()
+    
+    logger.info("🚀 [BOOT] root_agent is now initialized with LR_ tools.")
+    return root_agent
+
+```
+
+---
+
+### 3. 서버 실행 시점(`main.py`)에서 초기화 호출
+
+자바 스프링 부트에서 `ApplicationRunner`를 통해 앱 시작 시 특정 로직을 실행하듯, FastAPI의 `lifespan`이나 `startup`에서 `init_agent()`를 **`await`** 해줘야 합니다.
+
+```python
+# main.py (서버의 진입점)
+
+from agents.device_info import init_agent
+
+@app.on_event("startup")
+async def startup_event():
+    # 서버가 뜨는 시점에 비동기로 도구를 다 긁어오고 래핑을 완료함
+    # 이 과정이 완료될 때까지 서버는 요청을 받지 않고 대기합니다.
+    await init_agent()
+
+```
+
+---
+
+### 4. 왜 이렇게 해야 하나요? (자바 관점의 이유)
+
+1. **`already defined` 방지**: `init_agent`가 호출될 때마다 새로운 리스트를 만들어 `root_agent.tools`에 통째로 할당하기 때문에, 기존 도구들과 이름이 충돌하거나 중복 등록되는 일이 발생하지 않습니다.
+2. **`never awaited` 방지**: 서버 진입점(`startup`)에서 명확히 `await`를 걸어주기 때문에, 코루틴 객체가 방치되지 않고 실제 에이전트 객체가 생성됩니다.
+3. **패키지 캡슐화**: `__init__.py`에서 `__all__`을 관리함으로써 외부 레이어(Controller 등)는 내부의 복잡한 비동기 초기화 과정을 몰라도 `from agents.device_info import root_agent`로 접근할 수 있습니다.
+
+### **전문가의 팁**
+
+만약 컨트롤러에서 여전히 `root_agent`가 `None`이라고 나온다면, 그것은 `init_agent()`가 호출되기 전에 요청이 들어온 경우입니다. 이를 위해 컨트롤러 상단에 `if root_agent is None: await init_agent()`를 한 줄 추가하는 것은 자바의 **Lazy Initialization(지연 초기화)** 패턴과 동일하게 안전한 방법입니다.
+
+이제 `__init__.py`는 그대로 두시고, `agent.py`에 `init_agent` 비동기 함수를 구현하여 서버 실행 시점에 딱 한 번만 실행되도록 설정해 보세요! 그러면 31개의 도구가 `LR_` 접두어와 함께 아름답게 로그에 찍힐 것입니다.
+
+마지막으로, **에이전트에게 전달할 인스트럭션(Instruction)에 "이름이 LR_로 시작하는 도구를 우선적으로 사용하라"는 내용을 추가**하셨나요? 에이전트가 래핑된 도구를 선택하게 만드는 마지막 퍼즐 조각입니다. 이 부분도 도와드릴까요?
+----
+
 소프트웨어 전문가로서 자바 개발자이신 사용자님의 배경에 맞춰 설명해 드리면, 파이썬의 `__all__`은 자바의 **`public` 인터페이스 정의** 또는 **패키지 익스포트(Export) 설정**과 비슷합니다.
 
 `__all__`에 포함된 이름들만 외부 파일에서 `from module import *`를 했을 때 가져갈 수 있게 제한하는 일종의 **"공개 명단"**입니다. 비동기 초기화 방식을 적용하면서 이 명단을 유지하는 방법을 알려드립니다.
