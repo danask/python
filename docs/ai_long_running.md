@@ -1,4 +1,103 @@
 
+자바 개발자 관점에서 이 에러는 **`NullPointerException`**과 정확히 같은 상황입니다.
+
+`app.py`가 실행되는 시점(Import 타임)에는 아직 `init_agent()`가 호출되지 않았기 때문에 `root_agent`는 `None`인 상태입니다. 자바로 치면 **초기화되지 않은 정적 변수의 필드에 접근**하려다 터지는 것이죠.
+
+이를 해결하기 위해 **지연 생성(Lazy Initialization)** 방식을 적용해야 합니다. `app` 객체 생성을 `init_agent` 안으로 옮기거나, `app`을 상수로 두지 않고 필요할 때 생성하도록 변경해야 합니다.
+
+---
+
+### 1. 해결 방법: `init_agent` 내부에서 `app` 완성하기
+
+가장 깔끔한 방법은 `root_agent`가 준비된 직후에 `app`의 속성을 채워넣는 것입니다.
+
+**[agent.py 수정]**
+
+```python
+# agent.py
+
+# 1. 초기 선언 (자바의 private static RootAgent root_agent = null;)
+root_agent = None
+app = None  # app도 처음엔 비워둡니다.
+
+async def init_agent():
+    global root_agent, app
+    
+    # 2. 에이전트 생성 (비동기 완료 대기)
+    root_agent = await create_agent_async()
+    
+    # 3. 에이전트가 완성된 후 app 객체를 생성 (자바의 late binding)
+    # root_agent.name이 이제 존재하므로 에러가 나지 않습니다.
+    from adk import App  # App 클래스 임포트
+    app = App(
+        name=root_agent.name, 
+        description=root_agent.description,
+        # ... 나머지 설정
+    )
+    
+    logger.info(f"🚀 [INIT] App '{app.name}' initialized successfully.")
+    return root_agent
+
+```
+
+---
+
+### 2. 왜 `app.py`에서 직접 선언하면 안 되나요?
+
+파이썬은 파일을 `import` 하는 순간 최상위 레벨(Top-level)의 코드를 즉시 실행합니다.
+
+* 서버 부팅 → `app.py` 임포트 → `app = App(name=root_agent.name, ...)` 실행
+* **문제:** 이때 `root_agent`는 아직 `None`입니다. (`None.name`을 참조하려니 에러 발생)
+* 자바라면 `static` 블록에서 `null` 객체의 메서드를 호출한 꼴입니다.
+
+---
+
+### 3. `__init__.py`에서의 참조 방식 수정
+
+`app`과 `root_agent`가 처음엔 `None`이었다가 나중에 채워지더라도 외부에서 동일한 이름으로 참조할 수 있게 `__init__.py`를 구성해야 합니다.
+
+**[agents/device_info/init.py]**
+
+```python
+# 패키지 레벨에서 이름을 미리 등록해둡니다.
+__all__ = ["root_agent", "app", "init_agent"]
+
+# agent.py에 정의된 변수와 함수를 연결합니다.
+from .agent import root_agent, app, init_agent
+
+```
+
+---
+
+### 4. 최종 부팅 순서 (이대로 따라하시면 됩니다)
+
+1. **`main.py` (또는 실행 진입점):** 서버를 띄울 때 가장 먼저 `await init_agent()`를 실행합니다.
+2. **`init_agent()` 실행:** * 비동기로 MCP 도구들을 긁어옵니다.
+* 도구들에 `LR_` 접두어를 붙여 래핑합니다.
+* `root_agent` 객체를 생성합니다.
+* **마지막으로 `app` 객체를 생성하여 `root_agent.name`을 주입합니다.**
+
+
+
+### **전문가의 조언**
+
+만약 `app` 객체가 `device_info_app`이라는 이름으로 이미 다른 곳에서 복잡하게 정의되어 있다면, `app.name = root_agent.name` 처럼 **객체 생성 후 속성만 나중에 덮어쓰는(Setter 역할)** 방식을 사용해도 됩니다.
+
+```python
+async def init_agent():
+    global root_agent, app
+    root_agent = await create_agent_async()
+    
+    # 이미 생성된 app 객체가 있다면 이름만 업데이트
+    app.name = root_agent.name
+    app.description = root_agent.description
+
+```
+
+이렇게 하면 `app.py`에서 발생하는 `NoneType` 에러를 완벽하게 피하면서, 런타임에 올바른 에이전트 정보를 주입할 수 있습니다. 이제 에러 없이 서버가 잘 뜨나요?
+
+-----
+
 자바 개발자이신 사용자님께 익숙한 개념으로 설명해 드리면, `__init__.py`는 자바의 **`package-info.java`** 또는 **패키지 레벨의 인터페이스 정의**와 매우 유사합니다. 해당 패키지를 `import` 할 때 무엇을 밖으로 노출할지 결정하는 통제실 역할을 하죠.
 
 현재 상황에서 **비동기 초기화(Async Init)**를 적용하면서 `__init__.py`의 `__all__` 설정을 유지하는 가장 표준적인 방법은 다음과 같습니다.
