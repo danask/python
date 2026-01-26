@@ -1,4 +1,103 @@
 
+
+자바 개발자이신 사용자님께 가장 익숙한 방식으로 이 문제를 해결해 보겠습니다. 이 상황은 **"상태 플래그(State Flag)"**를 사용하여 초기화 여부를 관리하는 전형적인 싱글톤 초기화 패턴으로 해결해야 합니다.
+
+`LR_` 접두어를 제거하기로 했으므로, 이제는 도구 이름 대신 **에이전트 객체 자체에 "초기화 완료" 마킹**을 하거나, 별도의 **불리언(Boolean) 변수**를 두어 체크해야 합니다.
+
+---
+
+### 1. `agent.py`: 초기화 상태 변수 도입
+
+자바에서 `private boolean isInitialized = false;`를 두는 것과 같습니다.
+
+```python
+# agents/device_info/agent.py
+
+# 초기화 여부를 저장하는 전역 플래그
+_is_tools_initialized = False
+
+async def refresh_agent_tools(agent):
+    global _is_tools_initialized
+    
+    # ... (이름은 유지하고 로직만 래핑하는 기존 코드) ...
+    # 래퍼 생성 시 agent_tool_name을 원본 이름과 동일하게 설정
+    for tool in actual_tools:
+        wrapped = create_long_running_mcp_tool(toolset, tool.name)
+        wrapped.name = tool.name # 원본 이름 유지
+        new_tools.append(wrapped)
+
+    agent.tools = new_tools
+    
+    # [핵심] 플래너가 도구를 캐싱하고 있을 경우를 대비한 강제 갱신
+    if hasattr(agent, "planner") and hasattr(agent.planner, "tools"):
+        agent.planner.tools = new_tools
+
+    # 초기화 완료 마킹
+    _is_tools_initialized = True
+    logger.info("🚀 [SUCCESS] MCP Tools successfully hot-swapped (Original names preserved).")
+
+def is_initialized():
+    return _is_tools_initialized
+
+```
+
+---
+
+### 2. `controller.py`: 상태 체크 로직 수정
+
+이제 `LR_` 접두어 검색 대신, `is_initialized()` 함수를 호출하여 판단합니다.
+
+```python
+# controller.py
+from agents.device_info.agent import get_root_agent, refresh_agent_tools, is_initialized
+
+@router.post("/v1/chat-device-info")
+async def chat_device_info(...):
+    agent = get_root_agent()
+    
+    # LR_ 접두어 대신 플래그 값으로 판단 (자바의 Singleton Double-Checked Locking과 유사)
+    if not is_initialized():
+        logger.info("🛠️ [LAZY-INIT] First request detected. Replacing tool logic...")
+        await refresh_agent_tools(agent)
+    
+    # 디버깅: LLM이 보게 될 최종 도구 이름 목록 확인
+    logger.debug(f"🔍 Current Agent Tools: {[t.name for t in agent.tools]}")
+    
+    return await _handle_chat_request(...)
+
+```
+
+---
+
+### 3. `DeviceInfo` 스키마 에러에 대한 전략 (중요)
+
+이름을 원본과 똑같이 만들었기 때문에 이제 LLM은 도구를 잘 호출할 것입니다. 하지만 **리턴값이 `operation_id`를 포함한 JSON**이기 때문에 `DeviceInfo` 스키마와 충돌할 수 있습니다. 이를 해결하기 위한 두 가지 팁입니다.
+
+* **에이전트 인스트럭션 수정**: `Agent` 생성 시 `instruction`에 "모든 도구의 결과는 작업 ID(operation_id)를 포함한 중간 결과이므로, 이를 그대로 `full_output`에 담아라"고 명시해야 합니다.
+* **스키마 유연화**: `DeviceInfo` 클래스(Pydantic 모델)의 필드 타입을 좀 더 넓게 정의하거나, 래퍼가 반환하는 형식을 `DeviceInfo`가 기대하는 형식으로 살짝 감싸주어야 합니다.
+
+---
+
+### 4. LLM이 보는 목록 캐치 (Tracing)
+
+LLM이 실제로 어떤 도구 리스트를 컨텍스트에 넣고 쿼리하는지 확인하려면, 프로젝트 내에 **Langfuse**나 **OTEL(OpenTelemetry)** 설정이 되어 있는지 확인해 보세요.
+만약 없다면, 아래 코드를 컨트롤러에 잠시 넣어 LLM에게 가는 "진짜 프롬프트"를 가로챌 수 있습니다.
+
+```python
+# controller 실행 직전
+for tool in agent.tools:
+    # 각 도구가 가진 JSON 스키마(LLM이 읽는 명세서)를 출력
+    if hasattr(tool, 'to_json'):
+        logger.info(f"Tool Spec: {tool.to_json()}")
+
+```
+
+### **전문가의 최종 제언**
+
+`LR_` 접두어를 떼는 순간, LLM은 혼란 없이 도구를 선택할 것입니다. 다만 **"도구의 실행 결과값"**이 바뀌었으므로, LLM이 그 결과(operation_id)를 보고 "아, 이건 아직 끝난 게 아니구나"라고 판단하게 하는 프롬프트 보강이 필수적입니다.
+
+이제 `is_initialized` 플래그를 도입해서 테스트해 보시겠어요? 이름 불일치 에러는 사라지고, 스키마 매칭 부분만 조정하면 완벽할 것 같습니다. 다음 단계로 무엇을 도와드릴까요? 추가로 `DeviceInfo` 스키마 에러 로그의 상세 내용을 보여주시면 더 정확한 해결책을 드릴 수 있습니다.
+
 소프트웨어 전문가로서 현재 겪고 계신 문제를 정밀 진단해 드립니다. 자바 개발자 입장에서 이 현상은 **"데이터 스키마 불일치(Schema Mismatch)"**와 **"객체 참조의 파편화(Object Reference Fragmentation)"** 문제입니다.
 
 결론부터 말씀드리면, **`LR_` 접두어를 쓰지 않고 원본 이름 그대로 래핑**하되, **에이전트 내부의 도구 관리 방식(Tool Mapping)**을 강제로 동기화해야 합니다.
