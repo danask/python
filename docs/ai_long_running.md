@@ -1,4 +1,188 @@
 
+소프트웨어 전문가로서, 불필요한 도구를 제거하고 **관심사 분리(Separation of Concerns)** 원칙을 적용하여 최적화한 최종본 코드를 제공합니다.
+
+이 구조는 **컨트롤러**가 실행 흐름(오케스트레이션)을 제어하고, **에이전트**는 오직 비즈니스 데이터 해석에만 집중하며, **래퍼**는 기술적인 비동기 처리를 담당하는 가장 깔끔한 아키텍처입니다.
+
+---
+
+### 1. `controller.py` (최종 오케스트레이터)
+
+에이전트로부터 `operation_id`를 가로채고, 백그라운드에서 폴링을 수행한 뒤, 최종 결과 데이터를 에이전트에게 다시 주입하여 답변을 완성합니다.
+
+```python
+import asyncio
+from google.adk.agents.events import Event
+from google.genai import types
+from common.logger import logger
+from common.tools.mcp_tool.mcp_long_running_wrapper import get_mcp_operation_status
+
+# --- ADK 공식 가이드 기반 헬퍼 함수 ---
+def get_long_running_function_call(event: Event):
+    if not event.long_running_tool_ids or not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_call and part.function_call.id in event.long_running_tool_ids:
+            return part.function_call
+    return None
+
+def get_function_response(event: Event, function_call_id: str):
+    if not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_response and part.function_response.id == function_call_id:
+            return part.function_response
+    return None
+
+# --- 수정된 이벤트 생성 로직 ---
+async def generate_events(runner: Any, content: types.Content, user_id: str, session_id: str):
+    try:
+        # Stage 1: 에이전트 실행 및 롱러닝 도구 호출 가로채기
+        events_async = runner.run_async(
+            new_message=content,
+            user_id=user_id,
+            session_id=session_id,
+            run_config=RunConfig(streaming_mode=StreamingMode.NONE),
+        )
+
+        last_fc, last_fr = None, None
+
+        async for event in events_async:
+            if not last_fc:
+                last_fc = get_long_running_function_call(event)
+            else:
+                potential_fr = get_function_response(event, last_fc.id)
+                if potential_fr:
+                    last_fr = potential_fr
+            
+            # 1차 실행 중 발생하는 텍스트 등은 사용자에게 전달
+            yield get_response_text_from_event(event)
+
+        # Stage 2: 롱러닝 도구가 감지된 경우 결과 폴링 및 재실행
+        if last_fr:
+            operation_id = last_fr.response.get("operation_id")
+            logger.info(f"⏳ [POLLING] Operation ID: {operation_id}")
+
+            final_data = None
+            while True:
+                status_info = get_mcp_operation_status(operation_id)
+                if status_info and status_info["status"] == "completed":
+                    final_data = status_info["result"]
+                    break
+                elif status_info and status_info["status"] == "failed":
+                    final_data = {"error": status_info.get("error", "Task failed")}
+                    break
+                await asyncio.sleep(2) # 2초 간격 폴링
+
+            # 결과를 담은 업데이트된 응답 생성 (DeviceInfo 스키마와 매칭됨)
+            updated_response = last_fr.model_copy(deep=True)
+            updated_response.response = {"result": final_data}
+
+            logger.info("✅ [RESUME] Injecting final result to Agent")
+            
+            # 2차 실행: 에이전트가 진짜 데이터를 보고 최종 답변 생성
+            async for event in runner.run_async(
+                session_id=session_id,
+                user_id=user_id,
+                new_message=types.Content(
+                    parts=[types.Part(function_response=updated_response)], 
+                    role='user'
+                )
+            ):
+                yield get_response_text_from_event(event)
+
+    except Exception as e:
+        logger.exception(f"Error in event generation: {e}")
+        yield get_error_response(e)
+
+```
+
+---
+
+### 2. `agent.py` (최종 에이전트 정의)
+
+지적하신 대로 `check_mcp_operation_status_tool`을 제거하여 LLM이 도구 선택 시 혼란을 겪지 않도록 최적화했습니다.
+
+```python
+# agents/device_info/agent.py (주요 부분)
+
+def create_agent():
+    # ... (MCP 툴셋 로드 및 allow_list 설정 생략) ...
+
+    long_running_tools = []
+    for toolset in tools:
+        if hasattr(toolset, "tools"):
+            for tool in toolset.tools:
+                # 필터링 조건에 맞는 도구만 래핑
+                if any(tool.name.startswith(p) for p in allow_list):
+                    # 원본 이름 그대로 사용하여 래핑 (LR_ 접두어 제거)
+                    long_running_tools.append(
+                        create_long_running_mcp_tool(toolset, tool.name)
+                    )
+
+    # 에이전트가 직접 상태를 체크할 필요가 없으므로 check_ 툴은 제외
+    final_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+    ]
+    final_tools.extend(long_running_tools)
+
+    return Agent(
+        # ... (생략) ...
+        tools=final_tools,
+        instruction=(
+            f"{INSTRUCTION}\n"
+            "일부 도구는 실행 직후 operation_id를 반환하며, 시스템이 결과를 가져오는 동안 시간이 소요될 수 있습니다. "
+            "사용자에게 '데이터를 불러오는 중이니 잠시만 기다려 주세요'라고 안내하세요."
+        ),
+        # output_schema=DeviceInfo, # 이제 최종 주입 데이터가 이 스키마를 만족하므로 에러가 나지 않습니다.
+    )
+
+```
+
+---
+
+### 3. `long_running_wrapper.py` (최종 래퍼)
+
+`LongRunningFunctionTool` 생성 시 원본 이름을 명시적으로 부여하여 LLM의 툴 맵 검색이 성공하도록 보장합니다.
+
+```python
+# common/tools/mcp_tool/mcp_long_running_wrapper.py
+
+class MCPLongRunningWrapper:
+    def create_long_running_tool(
+        self,
+        mcp_toolset: McpToolset,
+        tool_name: str,
+        # ... (생략) ...
+    ) -> LongRunningFunctionTool:
+        
+        def long_running_mcp_function(**kwargs) -> dict[str, Any]:
+            # ... (비동기 Task 실행 및 operation_id 생성 로직) ...
+            return {
+                "status": "started",
+                "operation_id": operation_id,
+                "message": f"Execution of {tool_name} is in progress."
+            }
+
+        # [핵심] name=tool_name을 설정하여 에이전트 내 도구 이름과 일치시킴
+        return LongRunningFunctionTool(
+            func=long_running_mcp_function,
+            name=tool_name 
+        )
+
+```
+
+---
+
+### **최종 구조의 장점**
+
+1. **에이전트 경량화**: `check_mcp_operation_status_tool`을 제거하여 LLM이 불필요한 도구 호출을 고민하지 않습니다.
+2. **스키마 완벽 지원**: LLM은 첫 실행에서 `operation_id`를 받고 멈췄다가, 컨트롤러가 넣어준 **진짜 데이터**를 보고 `DeviceInfo` 스키마에 맞춰 최종 답변을 작성합니다.
+3. **투명한 도구 관리**: `LR_` 같은 접두어 없이 원본 이름을 그대로 사용하므로, LLM의 사전 지식과 도구 정의가 완벽하게 일치하여 "툴을 찾을 수 없다"는 에러가 발생하지 않습니다.
+
+이제 이 코드를 적용하면 사용자님이 원하셨던 모든 시나리오가 깔끔하게 동작할 것입니다. 혹시 **폴링 타임아웃(예: 5분 이상 걸릴 경우)**에 대한 예외 처리 로직도 추가로 필요하신가요?
+
+---------------------
 
 자바 개발자이신 사용자님께 가장 익숙한 방식으로 이 문제를 해결해 보겠습니다. 이 상황은 **"상태 플래그(State Flag)"**를 사용하여 초기화 여부를 관리하는 전형적인 싱글톤 초기화 패턴으로 해결해야 합니다.
 
