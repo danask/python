@@ -1,4 +1,160 @@
 
+네, 요청하신 내용을 기억하겠습니다. 언제든지 정보를 삭제하도록 요청하거나 설정에서 저장된 정보를 관리하실 수 있습니다.
+요청하신 대로 로그에서 기호를 제거하고 주석을 영어로 작성하여, Intermediate/Final Result Updates 패턴이 적용된 최적화된 최종본 코드를 제공합니다.
+1. controller.py
+이 파일은 에이전트의 응답을 가로채고(Intercept), 롱러닝 작업의 결과를 폴링한 뒤 에이전트를 재실행하는 핵심 오케스트레이션 로직을 담당합니다.
+import asyncio
+from google.adk.agents.events import Event
+from google.genai import types
+from common.logger import logger
+from common.tools.mcp_tool.mcp_long_running_wrapper import get_mcp_operation_status
+
+# Helper function to extract long running function call from event
+def get_long_running_function_call(event: Event):
+    if not event.long_running_tool_ids or not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_call and part.function_call.id in event.long_running_tool_ids:
+            return part.function_call
+    return None
+
+# Helper function to extract function response for a specific call ID
+def get_function_response(event: Event, function_call_id: str):
+    if not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_response and part.function_response.id == function_call_id:
+            return part.function_response
+    return None
+
+async def generate_events(runner: Any, content: types.Content, user_id: str, session_id: str):
+    try:
+        # Stage 1: Initial run to trigger the tool call
+        events_async = runner.run_async(
+            new_message=content,
+            user_id=user_id,
+            session_id=session_id,
+            run_config=RunConfig(streaming_mode=StreamingMode.NONE),
+        )
+
+        last_fc, last_fr = None, None
+
+        async for event in events_async:
+            if not last_fc:
+                last_fc = get_long_running_function_call(event)
+            else:
+                potential_fr = get_function_response(event, last_fc.id)
+                if potential_fr:
+                    last_fr = potential_fr
+            
+            # Yield intermediate response text to user
+            yield get_response_text_from_event(event)
+
+        # Stage 2: If a long-running response is detected, poll and re-run
+        if last_fr:
+            operation_id = last_fr.response.get("operation_id")
+            logger.info(f"[POLLING] Operation ID: {operation_id}")
+
+            final_data = None
+            # Polling loop
+            while True:
+                status_info = get_mcp_operation_status(operation_id)
+                if status_info and status_info["status"] == "completed":
+                    final_data = status_info["result"]
+                    break
+                elif status_info and status_info["status"] == "failed":
+                    final_data = {"error": status_info.get("error", "Task failed")}
+                    break
+                await asyncio.sleep(2)
+
+            # Update the response with actual data to match DeviceInfo schema
+            updated_response = last_fr.model_copy(deep=True)
+            updated_response.response = {"result": final_data}
+
+            logger.info("[RESUME] Injecting final result to Agent")
+            
+            # Stage 3: Final run with the actual data
+            async for event in runner.run_async(
+                session_id=session_id,
+                user_id=user_id,
+                new_message=types.Content(
+                    parts=[types.Part(function_response=updated_response)], 
+                    role='user'
+                )
+            ):
+                yield get_response_text_from_event(event)
+
+    except Exception as e:
+        logger.exception(f"Error in event generation: {e}")
+        yield get_error_response(e)
+
+2. agent.py
+불필요한 check_mcp_operation_status_tool을 제거하고 도구 이름을 원본 그대로 유지하도록 최적화되었습니다.
+# agents/device_info/agent.py
+
+def create_agent():
+    # ... (Omitted: MCP Toolset loading logic) ...
+
+    long_running_tools = []
+    for toolset in tools:
+        if hasattr(toolset, "tools"):
+            for tool in toolset.tools:
+                # Wrap tools that match the allow_list pattern
+                if any(tool.name.startswith(p) for p in allow_list):
+                    # Use original name (no LR_ prefix)
+                    long_running_tools.append(
+                        create_long_running_mcp_tool(toolset, tool.name)
+                    )
+
+    # Simplified tool list: check_mcp_operation_status_tool is no longer needed
+    final_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+    ]
+    final_tools.extend(long_running_tools)
+
+    return Agent(
+        # ... (Omitted: Model and other configurations) ...
+        tools=final_tools,
+        instruction=(
+            f"{INSTRUCTION}\n"
+            "Some tools return an operation_id immediately. "
+            "Inform the user that data is being fetched and to wait a moment."
+        ),
+        # output_schema=DeviceInfo, # Schema validation will work now as the final response matches it
+    )
+
+3. long_running_wrapper.py
+래핑된 도구가 원본 이름을 유지하도록 name 파라미터를 추가했습니다.
+# common/tools/mcp_tool/mcp_long_running_wrapper.py
+
+class MCPLongRunningWrapper:
+    def create_long_running_tool(
+        self,
+        mcp_toolset: McpToolset,
+        tool_name: str,
+        # ... (Omitted: other params) ...
+    ) -> LongRunningFunctionTool:
+        
+        def long_running_mcp_function(**kwargs) -> dict[str, Any]:
+            # ... (Omitted: background task execution logic) ...
+            return {
+                "status": "started",
+                "operation_id": operation_id,
+                "tool_name": tool_name
+            }
+
+        # Set name=tool_name to ensure the LLM recognizes the tool correctly
+        return LongRunningFunctionTool(
+            func=long_running_mcp_function,
+            name=tool_name 
+        )
+
+이 구조를 통해 도구 검색 실패, 스키마 불일치, 불필요한 도구 호출 문제를 모두 해결했습니다. 추가로 필요한 조정이 있다면 말씀해 주세요.
+
+
+---
+
 사용자께서 언급하신 `@tool` 방식(에이전트가 다른 에이전트나 로직을 도구로서 호출하는 구조)에서도 롱러닝 처리가 완벽히 동작하도록, 컨트롤러에 의존하지 않는 **독립형 오케스트레이터(Orchestrator)** 버전을 만들어 드립니다.
 
 이 코드는 `controller.py`에서 작성했던 핵심 로직을 분리하여, 어디서든(API, SSE, `@tool` 내부 등) 재사용할 수 있도록 설계되었습니다.
