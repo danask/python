@@ -1,4 +1,148 @@
 
+사용자께서 언급하신 `@tool` 방식(에이전트가 다른 에이전트나 로직을 도구로서 호출하는 구조)에서도 롱러닝 처리가 완벽히 동작하도록, 컨트롤러에 의존하지 않는 **독립형 오케스트레이터(Orchestrator)** 버전을 만들어 드립니다.
+
+이 코드는 `controller.py`에서 작성했던 핵심 로직을 분리하여, 어디서든(API, SSE, `@tool` 내부 등) 재사용할 수 있도록 설계되었습니다.
+
+### 1. 공통 오케스트레이터 유틸리티 (`common/agent_utils.py`)
+
+이 함수는 에이전트 실행, 롱러닝 감지, 폴링, 결과 주입을 한 번에 처리하는 **State Machine** 역할을 합니다.
+
+```python
+import asyncio
+from typing import Any, AsyncGenerator
+from google.adk.agents.events import Event
+from google.genai import types
+from common.logger import logger
+from common.tools.mcp_tool.mcp_long_running_wrapper import get_mcp_operation_status
+
+# Helper: Extract long running function call
+def get_long_running_function_call(event: Event):
+    if not event.long_running_tool_ids or not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_call and part.function_call.id in event.long_running_tool_ids:
+            return part.function_call
+    return None
+
+# Helper: Extract function response
+def get_function_response(event: Event, function_call_id: str):
+    if not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if part.function_response and part.function_response.id == function_call_id:
+            return part.function_response
+    return None
+
+# Core Orchestrator: Decoupled from Controller
+async def run_agent_with_polling(
+    runner: Any, 
+    content: types.Content, 
+    user_id: str, 
+    session_id: str
+) -> AsyncGenerator[Event, None]:
+    """
+    Orchestrates the agent execution flow including long-running tool polling.
+    Can be used in Controllers, SSE, or internal @tool calls.
+    """
+    # Stage 1: Initial execution
+    events_async = runner.run_async(
+        new_message=content,
+        user_id=user_id,
+        session_id=session_id
+    )
+
+    last_fc, last_fr = None, None
+    async for event in events_async:
+        if not last_fc:
+            last_fc = get_long_running_function_call(event)
+        else:
+            potential_fr = get_function_response(event, last_fc.id)
+            if potential_fr:
+                last_fr = potential_fr
+        
+        # Stream events to the caller (important for SSE or intermediate logs)
+        yield event
+
+    # Stage 2: If a long-running tool was triggered, poll for results
+    if last_fr:
+        operation_id = last_fr.response.get("operation_id")
+        logger.info(f"[POLLING] Starting status check for Operation ID: {operation_id}")
+
+        final_data = None
+        while True:
+            status_info = get_mcp_operation_status(operation_id)
+            if status_info and status_info["status"] == "completed":
+                final_data = status_info["result"]
+                break
+            elif status_info and status_info["status"] == "failed":
+                final_data = {"error": status_info.get("error", "Unknown error")}
+                break
+            # Wait for 2 seconds before next poll
+            await asyncio.sleep(2)
+
+        # Stage 3: Inject the real data back to the agent for the final answer
+        updated_response = last_fr.model_copy(deep=True)
+        updated_response.response = {"result": final_data}
+
+        logger.info("[RESUME] Injecting final data into Agent session")
+        async for event in runner.run_async(
+            session_id=session_id,
+            user_id=user_id,
+            new_message=types.Content(
+                parts=[types.Part(function_response=updated_response)], 
+                role='user'
+            )
+        ):
+            yield event
+
+```
+
+---
+
+### 2. `@tool` 에서 사용하는 방법
+
+이제 다른 에이전트가 이 로직을 도구로서 직접 호출할 때 아래와 같이 사용할 수 있습니다.
+
+```python
+from google.adk.tools import tool
+from common.agent_utils import run_agent_with_polling
+
+@tool
+async def device_troubleshoot_tool(query: str):
+    """
+    Diagnostic tool for device troubleshooting. 
+    Handles long-running tasks internally.
+    """
+    # Setup runner and session (simplified)
+    session, runner = await setup_device_agent_runner()
+    content = types.Content(role='user', parts=[types.Part(text=query)])
+    
+    final_text = ""
+    # Use the shared orchestrator
+    async for event in run_agent_with_polling(runner, content, "system_user", session.id):
+        # Accumulate text results from the sub-agent
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if part.text:
+                    final_text += part.text
+                    
+    # Return the final aggregated result to the parent agent
+    return final_text
+
+```
+
+---
+
+### 3. 마이그레이션 후의 장점
+
+1. **중복 제거**: API Controller와 `@tool` 로직이 동일한 `run_agent_with_polling`을 공유하므로 유지보수가 매우 쉬워집니다.
+2. **SSE 호환**: `yield event` 구조를 유지했기 때문에, SSE 엔드포인트에서 이 함수를 호출하기만 하면 중간 과정이 실시간으로 클라이언트에 전달됩니다.
+3. **기호 및 언어 규칙 준수**: 로그에서 기호를 제거하고 모든 주석을 영어로 작성하여 요청하신 표준을 맞췄습니다.
+
+이제 이 공통 유틸리티를 프로젝트의 `common` 폴더 등에 배치하고, 필요한 곳에서 불러다 쓰시면 됩니다. 추가로 특정 실행 환경에서 세션 관리가 필요하시면 말씀해 주세요!
+
+----
+
 소프트웨어 전문가로서, 불필요한 도구를 제거하고 **관심사 분리(Separation of Concerns)** 원칙을 적용하여 최적화한 최종본 코드를 제공합니다.
 
 이 구조는 **컨트롤러**가 실행 흐름(오케스트레이션)을 제어하고, **에이전트**는 오직 비즈니스 데이터 해석에만 집중하며, **래퍼**는 기술적인 비동기 처리를 담당하는 가장 깔끔한 아키텍처입니다.
