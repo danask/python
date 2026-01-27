@@ -171,7 +171,84 @@ class MCPLongRunningWrapper:
         )
 
 ```
+소프트웨어 전문가로서 분석해 본 결과, 현재 구조는 **글로벌 환경 변수**, **도구별 개별 설정**, 그리고 **컨트롤러 폴링 간격**이라는 세 가지 레벨에서 시간을 제어할 수 있는 유연한 구조를 이미 갖추고 있습니다.
 
+자바의 `Timeout` 설정이나 `ScheduledExecutorService` 설정과 유사한 방식으로 관리할 수 있습니다. 각 부분에서 어떻게 시간을 조절하는지 정리해 드립니다.
+
+---
+
+### 1. Global Default Settings (Environment Variables)
+
+`long_running_wrapper.py`를 보시면 시스템 전체의 기본 타임아웃과 예상 소요 시간을 환경 변수로 관리하고 있습니다. 코드를 수정하지 않고 `.env` 파일이나 시스템 설정만으로 조절이 가능합니다.
+
+* **`DEFAULT_ESTIMATED_DURATION`**: 도구가 실행되는 데 걸릴 것으로 예상되는 시간 (기본 180초).
+* **`DEFAULT_TOOL_TIMEOUT`**: 이 시간이 지나면 작업을 강제로 중단하거나 실패로 간주하는 시간 (기본 300초).
+
+```python
+# In long_running_wrapper.py
+DEFAULT_ESTIMATED_DURATION = int(os.getenv("MCP_DEFAULT_DURATION", "180"))
+DEFAULT_TOOL_TIMEOUT = int(os.getenv("MCP_TOOL_TIMEOUT", "300"))
+
+```
+
+### 2. Tool-specific Settings (Granular Control)
+
+`agent.py`에서 특정 도구에 대해서만 다른 시간을 적용하고 싶다면, `create_long_running_mcp_tool`을 호출할 때 인자를 넘겨주면 됩니다.
+
+* **수정 예시 (`agent.py`):**
+특정 리스트 조회 툴은 금방 끝나지만, 복잡한 진단(`usp_diagnose`)은 더 오래 걸린다면 아래처럼 개별 설정이 가능합니다.
+
+```python
+# Inside agent.py -> create_agent()
+if tool.name == "usp_complex_diagnosis":
+    # Set longer duration/timeout for specific tool
+    lr_tool = create_long_running_mcp_tool(
+        toolset, 
+        tool.name, 
+        estimated_duration=600, # 10 mins
+        tool_timeout=900        # 15 mins
+    )
+else:
+    lr_tool = create_long_running_mcp_tool(toolset, tool.name)
+
+```
+
+### 3. Polling Interval (Controller Level)
+
+`controller.py`에서 실제 결과를 얼마나 자주 체크할지는 `asyncio.sleep` 값으로 결정됩니다.
+
+* **수정 위치 (`controller.py`):**
+실시간성이 중요하다면 시간을 줄이고, 서버 부하를 줄이려면 시간을 늘립니다.
+
+```python
+# Inside controller.py -> generate_events()
+while True:
+    status_info = get_mcp_operation_status(operation_id)
+    if status_info and status_info["status"] == "completed":
+        break
+    # Adjust polling frequency here
+    await asyncio.sleep(2) # Poll every 2 seconds
+
+```
+
+---
+
+### 4. 고려해야 할 "시간의 한계" (Critical Limit)
+
+현재 구조에서 주의해야 할 점은 **LLM 모델 자체의 응답 대기 시간(Read Timeout)**입니다.
+
+* 만약 폴링이 너무 오래 걸리면(예: 10분), 에이전트가 결과를 받기 전에 클라이언트(Browser)나 Gateway에서 HTTP Timeout이 발생할 수 있습니다.
+* **해결책:** 아주 긴 작업은 중간에 "작업이 진행 중입니다"라는 메시지를 먼저 스트리밍으로 쏴주고, 최종 결과는 별도로 처리하는 비동기 UI 처리가 필요할 수 있습니다.
+
+### **전문가의 최종 제언**
+
+현재 구조는 매우 합리적입니다.
+
+1. 대부분의 도구는 **환경 변수**로 일괄 관리하시고,
+2. 유독 오래 걸리는 특정 도구만 **`agent.py`에서 파라미터**로 시간을 늘려주시는 방식을 추천합니다.
+3. **로그에 타임아웃 발생 시 경고**를 남기도록 `wrapper.py`를 보강하면 운영 단계에서 훨씬 유리합니다.
+
+혹시 특정 도구가 5분 이상 걸려 클라이언트 타임아웃이 걱정되시나요? 그렇다면 **SSE(Server-Sent Events)를 통해 중간 진행 상황(Progress)을 클라이언트에 먼저 보내주는 로직**을 추가로 구현해 드릴 수 있습니다. 어떻게 하시겠어요?
 ---
 
 ### **최종 구조의 장점**
