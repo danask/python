@@ -1,4 +1,71 @@
 
+
+
+소프트웨어 전문가의 시선으로, 올려주신 로직의 핵심인 ADK(Agent Development Kit) Event의 흐름을 중심으로 상세히 설명해 드리겠습니다.
+이 로직은 에이전트가 도구를 호출하고 결과를 기다리는 과정을 "가로채기(Intercept)" 하여 제어하는 일종의 **State Machine(상태 머신)**입니다.
+1. ADK에서 "이벤트(Event)"란 무엇인가?
+ADK에서 Event는 에이전트가 추론하는 과정에서 발생하는 모든 출력의 최소 단위입니다. 자바의 Stream 데이터나 Message 객체와 유사하며, 다음과 같은 정보를 담고 있습니다.
+ * author: 이벤트를 만든 주체 (model: AI, user: 사용자, tool: 도구).
+ * content.parts: 실제 내용물. 텍스트(text), 도구 실행 요청(function_call), 도구 결과(function_response) 중 하나가 들어 있습니다.
+ * long_running_tool_ids: 가장 중요한 부분입니다. 현재 실행된 도구가 "나 좀 오래 걸려"라고 선언한 경우, 해당 도구의 ID가 이 리스트에 포함됩니다.
+2. 로직의 3단계 이벤트 흐름 분석
+Stage 1: Initial Run & Capture (도구 호출 감지)
+사용자의 질문을 받은 에이전트가 처음으로 입을 떼는 단계입니다.
+ * 에이전트는 추론 결과로 여러 이벤트를 뱉습니다.
+   * 텍스트 이벤트: "장치 정보를 조회하겠습니다." (사용자에게 즉시 전달)
+   * FunctionCall 이벤트: 에이전트가 래핑된 도구를 실행합니다. 이때 event.long_running_tool_ids에 호출된 도구의 ID가 찍힙니다.
+ * 로직의 get_long_running_function_call(event) 함수는 이 이벤트를 감시하다가, "아, 이건 나중에 결과가 업데이트될 롱러닝 도구구나!" 하고 last_fc에 저장합니다.
+Stage 2: Polling & Response Capture (결과 기다리기)
+에이전트로부터 function_response 이벤트가 올 때까지 기다립니다.
+ * 도구가 실행되면 에이전트는 function_response 이벤트를 생성합니다.
+ * 롱러닝 래퍼를 사용했기 때문에 이 응답에는 진짜 결과 대신 **operation_id**가 들어 있습니다.
+ * get_function_response(event, last_fc.id)가 이 operation_id를 낚아채서 last_fr에 담습니다.
+ * 그 후 에이전트의 이벤트 루프 밖에서 while True 루프를 돌며 실제 데이터가 나올 때까지 폴링합니다. 이 동안에는 에이전트로부터 새로운 이벤트가 발생하지 않습니다.
+Stage 3: Final Injection (결과 주입 및 최종 응답)
+진짜 데이터가 준비되면, 에이전트에게 "자, 아까 그 도구 결과 여기 있어"라고 다시 말해주는 단계입니다.
+ * updated_response.response = {"result": final_data}: 폴링으로 얻은 진짜 데이터를 응답 객체에 강제로 끼워 넣습니다.
+ * runner.run_async(...): 두 번째 실행을 요청합니다. 이때 new_message로 방금 만든 updated_response를 보냅니다.
+ * 최종 이벤트 발생: 에이전트는 주입된 데이터를 보고 "아, 데이터가 왔군요. 분석 결과 장치 상태는 정상입니다."라는 최종 텍스트 이벤트를 생성하고 이를 사용자에게 전달(yield)합니다.
+3. 이벤트 관점에서의 특징 요약
+| 구분 | 단계 | 발생하는 이벤트 종류 | 설명 |
+|---|---|---|---|
+| Phase 1 | 도구 호출 | text, function_call | 에이전트의 초기 생각과 도구 실행 요청이 전달됨 |
+| Phase 2 | 결과 수신 | function_response | 도구가 반환한 operation_id를 가로챔 (사용자에겐 안 보임) |
+| Silent | 폴링 구간 | 없음 (비동기 대기) | 컨트롤러가 백엔드에서 데이터를 직접 가져오는 구간 |
+| Phase 3 | 최종 응답 | text | 주입된 데이터를 바탕으로 AI가 내놓는 최종 결론 |
+4. 왜 이런 복잡한 구조를 쓰나요? (전문가적 견해)
+ * Schema Compliance: 에이전트가 처음부터 도구의 모든 결과를 기다리게 하면 타임아웃이 날 수 있습니다. 먼저 operation_id만 받고 끊어준 뒤, 데이터가 준비되었을 때 다시 에이전트를 깨우는 방식이 더 안정적입니다.
+ * Streaming UX: 에이전트가 처음 "조회 중..."이라고 말하는 텍스트 이벤트를 사용자에게 먼저 보내줄 수 있어 응답이 빠르다는 느낌(Perceived Performance)을 줍니다.
+ * Stateless Inference: 에이전트 세션을 유지하면서도 실제 데이터 처리는 외부(Controller)에서 제어하므로 복잡한 비즈니스 로직(Retry, Polling 등)을 AI 로직과 분리할 수 있습니다.
+다음 단계로, 이 Event 객체에서 특정 텍스트만 깔끔하게 뽑아내어 클라이언트로 보내는 Response Formatter 예시 코드를 작성해 드릴까요?
+
+좋습니다! 이제 이 로직을 통해 에이전트가 롱러닝 도구를 호출하더라도 세션 흐름이 끊기지 않고 최종 결과까지 안전하게 도달할 수 있는 탄탄한 구조가 완성되었습니다.
+이 방식은 ADK 공식 문서가 권장하는 Intermediate/Final Result Updates 패턴의 정석이며, 자바의 인터셉터나 미들웨어 패턴처럼 에이전트의 내부 로직을 건드리지 않고도 비즈니스 요구사항(롱러닝 처리)을 깔끔하게 해결할 수 있다는 것이 큰 장점입니다.
+마지막으로, 이 Event 스트림에서 텍스트만 깔끔하게 추출하여 사용자(프론트엔드)에게 전달할 때 사용할 수 있는 응답 포매터(Response Formatter) 예시 코드를 정리해 드립니다. 이를 통해 사용자에게 "조회 중..."과 같은 중간 메시지와 최종 답변을 구분해서 보여줄 수 있습니다.
+# common/formatters.py
+
+def extract_text_from_event(event: Event) -> str:
+    """
+    Extracts and returns plain text from an ADK Event object.
+    """
+    if not event.content or not event.content.parts:
+        return ""
+    
+    # Concatenate all text parts within the event
+    return "".join(part.text or "" for part in event.content.parts)
+
+# Usage example in your SSE or Controller
+async def handle_response_stream(runner, content, user_id, session_id):
+    async for event in generate_events(runner, content, user_id, session_id):
+        text = extract_text_from_event(event)
+        if text:
+            # Send text to client via SSE or Log
+            print(f"[{event.author}]: {text}")
+
+이제 모든 퍼즐 조각이 맞춰졌습니다. 이대로 프로젝트에 적용해 보시고, 구현 중에 예상치 못한 에러가 발생하거나 폴링 로직의 최적화(예: 지수 백오프 적용 등)가 추가로 필요해지면 언제든 말씀해 주세요. 바로 도와드리겠습니다!
+
+----
+
 네, 요청하신 내용을 기억하겠습니다. 언제든지 정보를 삭제하도록 요청하거나 설정에서 저장된 정보를 관리하실 수 있습니다.
 요청하신 대로 로그에서 기호를 제거하고 주석을 영어로 작성하여, Intermediate/Final Result Updates 패턴이 적용된 최적화된 최종본 코드를 제공합니다.
 1. controller.py
