@@ -1,3 +1,88 @@
+전문가로서 상황을 다시 진단해 드립니다. 현재 겪고 계신 문제는 **"비동기 초기화가 완료되지 않은 상태에서 동기식(Sync) 코드가 에이전트를 참조하려 할 때"** 발생하는 전형적인 의존성 순서 문제입니다.
+
+특히 `orchestrator` 등에서 모듈 임포트 시점에 `get_agent()`를 호출하면, 부팅 시 `await`가 완료되기 전이라 에러가 날 수밖에 없습니다. 이를 해결하기 위해 **FastAPI의 Lifespan을 통해 실행 순서를 강제**하고, **컨트롤러 호출 직전에 도구를 한 번 더 체크**하는 로직을 결합해야 합니다.
+
+가장 안정적인 `controller.py` 통합 방법을 제시해 드립니다.
+
+---
+
+### 1. `controller.py`: 실행 직전 지연 로딩 (Lazy Loading)
+
+컨트롤러에서 에이전트를 미리 임포트하지 말고, 요청이 들어왔을 때 초기화 여부를 확인하고 에이전트를 가져오도록 합니다.
+
+```python
+# controller.py
+
+from agents.device_info.agent import initialize_agent, get_agent, _root_agent
+from common.logger import logger
+
+async def generate_events(runner, content, user_id, session_id):
+    """실행 직전에 에이전트 상태를 체크하고 필요시 초기화합니다."""
+    try:
+        # 1. 에이전트가 아직 없다면 여기서 초기화 (최후의 보루)
+        global _root_agent
+        if _root_agent is None:
+            logger.info("[CONTROLLER] Agent not initialized. Initializing now...")
+            await initialize_agent()
+        
+        agent = get_agent()
+        
+        # 2. 이후 단계별 실행 (Stage 1, 2, 3) 로직 진행...
+        # ... (이전 코드와 동일)
+
+```
+
+### 2. `main.py`: 부팅 시점 강제 실행
+
+FastAPI가 켜지자마자 `initialize_agent`를 백그라운드 태스크로 던지거나 `lifespan`에서 `await` 합니다. 이렇게 하면 컨트롤러가 불리기 전에 대부분 초기화가 완료됩니다.
+
+```python
+# main.py
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from agents.device_info.agent import initialize_agent
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 서버 시작 시 비동기로 에이전트를 미리 만들어둠
+    import asyncio
+    asyncio.create_task(initialize_agent()) 
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+```
+
+### 3. 왜 이 방법이 최선인가요?
+
+이 구조는 **"Soft Initialization"** 패턴입니다.
+
+1. **순서 문제 해결**: `orchestrator`가 에이전트를 참조할 때, 전역 변수 `_root_agent`가 `None`이더라도 프로그램이 죽지 않게 설계합니다.
+2. **안전장치**: 만약 부팅 시 초기화가 MCP 서버 응답 지연으로 늦어지더라도, 사용자가 첫 질문을 던지는 순간 `generate_events` 내부의 `if _root_agent is None:` 블록이 작동하여 **그 자리에서 `await`를 걸고 초기화를 마무리**합니다.
+3. **동기/비동기 호환**: `initialize_agent` 자체는 `async`이지만, 이를 호출하는 시점을 **컨트롤러의 `async` 함수 내부**로 옮겼기 때문에 `await`를 사용할 수 없는 제약에서 벗어납니다.
+
+---
+
+### 결론: 수정 제안
+
+`agent.py`의 `get_agent` 함수를 아래와 같이 좀 더 유연하게 수정해 주세요.
+
+```python
+# agents/device_info/agent.py 수정
+
+def get_agent():
+    """초기화된 인스턴스를 반환하되, 없으면 에러 대신 None을 반환하여 컨트롤러가 판단하게 함"""
+    global _root_agent
+    return _root_agent
+
+```
+
+그리고 **컨트롤러의 `generate_events` 시작 부분**에 제가 위에 적어드린 `initialize_agent` 체크 로직을 넣으시면 됩니다. 이렇게 하면 `orchestrator`와의 참조 순서 꼬임 문제 없이 깔끔하게 MCP 도구들을 래핑해서 사용할 수 있습니다.
+
+이 방식으로 컨트롤러 코드를 수정해 볼까요? 아니면 `orchestrator`에서 구체적으로 어떻게 참조하고 있는지 알려주시면 더 맞춤형으로 짜드릴 수 있습니다.
+
+----
+
 소프트웨어 전문가로서 해당 라이브러리의 구현 방식을 정밀 분석해 본 결과, `LongRunningFunctionTool`의 생성자 파라미터가 일반 `FunctionTool`과 다르기 때문에 발생하는 문제입니다.
 
 ADK의 `LongRunningFunctionTool`은 보통 원본 도구 객체 자체를 인자로 받거나, 특정한 구조의 인자를 요구합니다. `tool.callable`과 같은 속성이 직접 매핑되지 않는 경우, **`from_tool` 클래스 메서드**를 사용하거나 **객체를 통째로 넘기는 방식**으로 해결해야 합니다.
