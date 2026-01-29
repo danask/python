@@ -1,4 +1,88 @@
 
+소프트웨어 전문가로서 이 에러의 원인과 해결책을 정확히 짚어드립니다.
+
+이 에러가 발생하는 이유는 `Agent` 객체가 필요한 시점(보통 `controller.py`나 다른 모듈이 임포트되는 시점)에 **비동기 초기화(`initialize_agent`)가 아직 완료되지 않았거나 호출되지 않았기 때문**입니다.
+
+자바에서 비동기 빈(Bean) 초기화가 끝나기 전에 해당 빈을 주입(Injection)받으려 할 때 발생하는 상황과 같습니다. 이를 해결하기 위해 **FastAPI의 `lifespan`**을 이용하여 부팅 시점에 순서를 강제해야 합니다.
+
+---
+
+### 1. 문제의 원인
+
+보통 `controller.py` 상단에서 에이전트를 임포트할 때 `agent = get_agent()`를 호출하는데, 이때 `_root_agent`가 여전히 `None`이라서 발생하는 에러입니다. `initialize_agent`는 `async` 함수라 부팅 과정에서 누군가가 `await`로 실행해줘야만 합니다.
+
+---
+
+### 2. 해결 방법: FastAPI Lifespan 적용
+
+`main.py`에서 서버가 시작될 때 `initialize_agent`가 끝날 때까지 기다리도록 설정합니다.
+
+#### `main.py` (또는 앱 진입점)
+
+```python
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from agents.device_info.agent import initialize_agent
+from common.logger import logger
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # [STEP 1] 서버 시작 시 에이전트 비동기 초기화 (도구 로드 및 래핑 완료까지 대기)
+    logger.info("Starting application lifespan...")
+    try:
+        await initialize_agent()
+        logger.info("Agent initialization successful.")
+    except Exception as e:
+        logger.error(f"Failed to initialize agent during startup: {e}")
+        # 초기화 실패 시 서버를 중단할지 여부를 결정 (필요시 raise)
+
+    yield  # 서버 운영 중
+
+    # [STEP 2] 서버 종료 시 정리 로직 (필요 시)
+    logger.info("Shutting down application lifespan...")
+
+app = FastAPI(lifespan=lifespan)
+
+```
+
+---
+
+### 3. `controller.py` 수정 (런타임 획득)
+
+에이전트를 모듈 레벨에서 미리 선언하지 말고, **요청이 들어왔을 때** `get_agent()`를 호출하도록 변경하세요. 그래야 초기화가 완료된 인스턴스를 안전하게 가져올 수 있습니다.
+
+```python
+# controller.py
+
+from agents.device_info.agent import get_agent
+
+async def _handle_chat_request(request: ChatRequest, user_id: str):
+    # 모듈 상단이 아닌, 함수 내부에서 에이전트를 가져옵니다.
+    # 이미 lifespan에서 초기화가 끝났으므로 안전합니다.
+    agent = get_agent() 
+    
+    # ... 이후 로직 동일
+
+```
+
+---
+
+### 4. 왜 이렇게 해야 하나요? (Flow Diagram)
+
+1. **순서 보장**: `lifespan` 내의 `await`는 서버가 HTTP 요청을 받기 시작하기 **직전**에 완료됩니다.
+2. **안전성**: MCP 도구가 아무리 늦게 로드되어도 `await`가 걸려있으므로, 에이전트가 완벽하지 않은 상태에서 쿼리를 받는 일을 방지합니다.
+3. **에러 방지**: `_root_agent가 먼저 시작되어야 한다`는 에러는 결국 `None`인 상태에서 접근했기 때문인데, 이 구조는 접근 시점에 반드시 값이 존재함을 보장합니다.
+
+---
+
+### 만약 `Agent` 인스턴스를 여러 개 관리해야 한다면?
+
+혹시 `device_info` 외에 다른 에이전트들도 비동기로 초기화해야 하나요? 그렇다면 `initialize_all_agents()` 같은 통합 함수를 만들어 `lifespan`에서 한 번에 `await` 처리하는 것이 관리 효율성 면에서 더 좋습니다. 필요하시면 통합 가이드를 더 드릴 수 있습니다.
+
+Would you like me to check if there are other parts of your code where the agent is being accessed before initialization?
+
+----
+
 소프트웨어 전문가로서, 부팅 시점에 MCP 도구들을 완벽하게 로드하고 `LongRunningFunctionTool`로 래핑하여 에이전트를 초기화하는 `initialize_agent` 전체 코드를 작성해 드립니다.
 
 이 구조는 **1. 도구 발견(Discovery)**, **2. 롱러닝 래핑(Wrapping)**, **3. 에이전트 생성(Initialization)** 단계를 명확히 분리하여 타이밍 이슈를 원천적으로 해결합니다.
