@@ -1,4 +1,210 @@
 
+소프트웨어 전문가로서, 부팅 시점에 MCP 도구들을 완벽하게 로드하고 `LongRunningFunctionTool`로 래핑하여 에이전트를 초기화하는 `initialize_agent` 전체 코드를 작성해 드립니다.
+
+이 구조는 **1. 도구 발견(Discovery)**, **2. 롱러닝 래핑(Wrapping)**, **3. 에이전트 생성(Initialization)** 단계를 명확히 분리하여 타이밍 이슈를 원천적으로 해결합니다.
+
+### 수정된 `agents/device_info/agent.py` 전체 코드
+
+```python
+import asyncio
+from typing import List, Any
+
+from google.adk.agents import Agent
+from google.adk.planners import BuiltInPlanner
+from google.genai import types
+
+from agents.device_info.prompts import DESCRIPTION, INSTRUCTION
+from common.callbacks import (
+    after_tool_upload_output_to_artifactservice_cb,
+    before_agent_renew_ai_jwt_cb,
+)
+from common.llm import get_dynamic_system_prompt
+from common.llm.bedrock import BEDROCK_AI_MODEL_MID as BEDROCK_AI_MODEL
+from common.logger import logger
+from common.tools import (
+    convert_timestamp_to_datetime,
+    load_compacted_response,
+    update_current_time,
+)
+from common.tools.mcp_tool.mcp_header_provider import header_provider
+from common.tools.mcp_tool.mcp_long_running_wrapper import (
+    DEFAULT_ESTIMATED_DURATION,
+    DEFAULT_TOOL_TIMEOUT,
+    check_mcp_operation_status_tool,
+    create_long_running_mcp_tool,
+)
+from common.tools.mcp_tool.mcp_tool_monitor import MCPToolMonitor
+from common.tools.mcp_tool.mcp_utils import get_tools
+
+# --- 전역 변수 및 상수 ---
+ALLOW_LIST = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+_root_agent = None
+_tool_monitor = None
+
+def get_tool_monitor():
+    """글로벌 도구 모니터 인스턴스를 반환하거나 생성합니다."""
+    global _tool_monitor
+    if _tool_monitor is None:
+        # 초기 빈 도구 목록으로 모니터 생성 (나중에 rediscover_tools로 채움)
+        _tool_monitor = MCPToolMonitor([], ALLOW_LIST)
+    return _tool_monitor
+
+# --- 핵심 로직: 도구 래핑 함수 ---
+
+def wrap_mcp_tools(toolsets: List[Any]) -> List[Any]:
+    """
+    발견된 MCP Toolset들을 순회하며 패턴에 맞는 도구들을 
+    LongRunningFunctionTool로 래핑합니다.
+    """
+    long_running_tools = []
+    
+    # 롱러닝으로 판단할 추가 키워드 패턴
+    long_running_patterns = [
+        "Get_", "get_", "list_", "report", "dashboard", 
+        "usage", "battery", "health", "details"
+    ]
+
+    for toolset in toolsets:
+        if not hasattr(toolset, "tools"):
+            continue
+            
+        for tool in toolset.tools:
+            tool_name = tool.name
+            should_wrap = False
+
+            # 1. ALLOW_LIST 패턴 매칭 (KAI 접두사 등)
+            if any(tool_name.startswith(p) for p in ALLOW_LIST):
+                should_wrap = True
+
+            # 2. 롱러닝 키워드 패턴 매칭
+            if not should_wrap:
+                if any(p.lower() in tool_name.lower() for p in long_running_patterns):
+                    should_wrap = True
+
+            if should_wrap:
+                logger.info(f"Wrapping long-running MCP tool: {tool_name}")
+                long_running_tools.append(
+                    create_long_running_mcp_tool(
+                        toolset,
+                        tool_name,
+                        estimated_duration=DEFAULT_ESTIMATED_DURATION,
+                        tool_timeout=DEFAULT_TOOL_TIMEOUT,
+                    )
+                )
+            else:
+                logger.debug(f"Skipping wrapping for tool: {tool_name}")
+    
+    return long_running_tools
+
+# --- 핵심 로직: 에이전트 생성 함수 ---
+
+def create_agent_instance(wrapped_mcp_tools: List[Any]) -> Agent:
+    """
+    래핑된 도구들과 정적 도구들을 조합하여 최종 Agent 객체를 생성합니다.
+    """
+    name = "device_info"
+    
+    # 1. 정적 도구와 래핑된 MCP 도구 결합
+    all_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+    all_tools.extend(wrapped_mcp_tools)
+
+    logger.info(f"Creating Agent '{name}' with {len(all_tools)} total tools")
+
+    return Agent(
+        model=BEDROCK_AI_MODEL,
+        name=name,
+        description=DESCRIPTION,
+        before_agent_callback=[update_current_time, before_agent_renew_ai_jwt_cb],
+        after_tool_callback=[after_tool_upload_output_to_artifactservice_cb],
+        instruction=(
+            f"{INSTRUCTION}\n"
+            f"Allowed tool prefixes: {', '.join(ALLOW_LIST)}.\n"
+            f"{get_dynamic_system_prompt('Current time: {_time}')}"
+        ),
+        planner=BuiltInPlanner(
+            thinking_config=types.ThinkingConfig(include_thoughts=True)
+        ),
+        tools=all_tools,
+        generate_content_config=types.GenerateContentConfig(
+            safety_settings=[
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold=types.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+                ),
+            ]
+        ),
+    )
+
+# --- 외부 호출 API: 초기화 함수 ---
+
+async def check_mcp_tools_status():
+    """MCP 서버와 통신하여 도구 목록을 최신화하고 상태를 반환합니다."""
+    # 1. 최신 Toolset 가져오기
+    toolsets = get_tools(
+        server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+        allow_list=ALLOW_LIST,
+        require_confirmation=False,
+        header_provider=header_provider,
+    )
+    
+    # 2. 모니터 업데이트
+    monitor = get_tool_monitor()
+    monitor.toolsets = toolsets  # 모니터 내부 Toolset 갱신
+    await monitor.rediscover_tools()
+    
+    monitor.log_summary()
+    return monitor
+
+async def initialize_agent():
+    """
+    [Main Entry Point] 
+    부팅 시 호출되어 모든 준비가 끝날 때까지 기다린 후 Agent를 반환합니다.
+    """
+    global _root_agent
+    logger.info("[INIT] Starting asynchronous agent initialization...")
+
+    try:
+        # Step 1: 도구 로드 및 발견 (Discovery) - 발견될 때까지 기다림
+        monitor = await check_mcp_tools_status()
+        
+        # Step 2: 로드된 Toolset들로부터 도구 래핑 (Wrapping)
+        wrapped_tools = wrap_mcp_tools(monitor.toolsets)
+        
+        # Step 3: Agent 인스턴스 생성 (Initialization)
+        _root_agent = create_agent_instance(wrapped_tools)
+        
+        logger.info("[INIT] Agent initialization completed successfully")
+        return _root_agent
+
+    except Exception as e:
+        logger.error(f"[INIT] Critical error during agent initialization: {e}")
+        raise
+
+def get_agent():
+    """초기화된 글로벌 에이전트 인스턴스를 가져옵니다."""
+    if _root_agent is None:
+        raise RuntimeError("Agent not initialized. Call initialize_agent() first.")
+    return _root_agent
+
+```
+
+### 이 코드의 주요 특징 및 개선 사항:
+
+1. **`wrap_mcp_tools`의 분리**: `create_agent` 안에 섞여 있던 복잡한 래핑 로직을 별도 함수로 추출했습니다. 이 함수는 `MCPToolMonitor`가 발견한 도구들을 입력받아 `LongRunningFunctionTool` 리스트를 반환합니다.
+2. **부팅 시 강제 동기화 (`await check_mcp_tools_status`)**: `initialize_agent` 내부에서 `await`를 사용하여 MCP 서버로부터 도구 목록이 도착할 때까지 기다립니다. 이를 통해 에이전트 생성 시점에 도구가 비어 있는 "타이밍 이슈"를 완벽히 해결합니다.
+3. **패턴 매칭 강화**: 기존 코드의 `allow_list` 기반 체크뿐만 아니라, `long_running_patterns`를 통해 `battery`, `usage`, `health` 등 실행 시간이 길 것으로 예상되는 도구들을 자동으로 감지하여 래핑합니다.
+4. **글로벌 인스턴스 관리**: `_root_agent`를 전역 변수로 관리하고 `get_agent()`를 통해 접근하게 하여, 애플리케이션 어디서든 초기화된 에이전트를 안전하게 사용할 수 있게 했습니다.
+5. **로그 가독성**: 로그에서 "✅" 기호를 제거하고 영문 메시지를 사용하여 시스템 로그의 호환성을 높였습니다.
+
+**사용 방법**:
+`FastAPI`의 `lifespan` 이벤트나 서버 시작 스크립트에서 `await initialize_agent()`를 호출하면 됩니다. 이제 `agent.py`가 부팅 시점에 MCP 서버와 통신하여 모든 도구를 롱러닝 방식으로 준비해둘 것입니다.
+
+-----
+
 소프트웨어 전문가로서 질문하신 두 가지 핵심 포인트(클래스 속성 설계와 도구 로드 타이밍 문제)를 자바 아키텍처 관점에서 정밀하게 분석해 드립니다.
 
 ### 1. `is_long_running` 변수가 왜 안 먹히나요? (Type vs Property)
