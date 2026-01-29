@@ -1,3 +1,73 @@
+전문가로서 명쾌하게 답변드립니다. **네, 대체하셔도 됩니다. 아니, 오히려 `initialize_agent`로 대체하시는 것이 아키텍처적으로 훨씬 우수하고 안정적입니다.**
+
+기존의 `refresh_agent_tools` 방식과 현재의 `initialize_agent` 방식은 **"도구를 최신화한다"**는 목적은 같지만, **"어떻게 최신화하느냐"**에서 큰 차이가 있습니다. 왜 대체하는 것이 유리한지 3가지 이유로 정리해 드립니다.
+
+---
+
+### 1. "일시적 땜질" vs "근본적 해결"
+
+* **기존 `refresh_agent_tools**`: 에이전트가 이미 생성된 후, 뒤늦게 도구를 하나씩 끼워 넣거나 교체하는 방식입니다. 이 과정에서 도구 간의 의존성이나 `LongRunningFunctionTool`로의 래핑이 누락될 위험이 큽니다.
+* **새로운 `initialize_agent**`: 에이전트 생성 전단계에서 **MCP 도구를 먼저 완벽하게 로드하고 래핑**한 뒤, 이를 포함한 에이전트를 통째로 만듭니다. 즉, 도구가 빠진 채로 에이전트가 동작할 틈을 주지 않습니다.
+
+### 2. 비동기(Async) 지원 유무
+
+* **기존 방식**: 보통 동기식으로 구현되어 있어, MCP 서버가 응답을 늦게 줄 경우 이를 기다리지 못하고 빈 도구 목록을 반환하기 일쑤였습니다.
+* **새로운 방식**: `await`를 통해 MCP 도구가 발견될 때까지 명시적으로 기다립니다. "나중에 쿼리할 때 문제없이 됐다"고 말씀하신 타이밍 이슈를 이 `await` 하나로 근본적으로 차단할 수 있습니다.
+
+### 3. 중복 작업 방지 (Idempotency)
+
+`initialize_agent` 내부에 `Lock`과 `if _root_agent is not None` 로직을 넣으면, 여러 번 호출해도 단 한 번만 초기화되므로 불필요하게 도구를 계속 새로 고치는 리소스 낭비를 막을 수 있습니다.
+
+---
+
+### 최종 제안: `agent.py` 통합 구조
+
+기존의 `refresh_agent_tools` 로직을 `initialize_agent` 안으로 흡수시킨 최종 형태입니다.
+
+```python
+# agents/device_info/agent.py
+
+_init_lock = asyncio.Lock()
+_root_agent = None
+
+async def initialize_agent(force_refresh: bool = False):
+    """
+    기존 refresh_agent_tools의 기능을 포함한 통합 초기화 함수입니다.
+    force_refresh=True인 경우 기존 에이전트를 버리고 새로 구성합니다.
+    """
+    global _root_agent
+    
+    async with _init_lock:
+        # 이미 초기화되었고 리프레시 강제가 아니면 그대로 반환
+        if _root_agent is not None and not force_refresh:
+            return _root_agent
+
+        logger.info(f"[INIT] {'Refreshing' if force_refresh else 'Initializing'} agent and MCP tools...")
+        
+        # 1. MCP 도구 로드 대기 (기존 refresh의 핵심 로직을 await로 처리)
+        monitor = await check_mcp_tools_status()
+        
+        # 2. 롱러닝 래핑 (가장 중요한 단계)
+        wrapped_tools = wrap_mcp_tools(monitor.toolsets)
+        
+        # 3. 새로운 에이전트 인스턴스 생성 및 교체
+        _root_agent = create_agent_instance(wrapped_tools)
+        
+        logger.info("[INIT] Agent is now ready with all tools wrapped.")
+        return _root_agent
+
+```
+
+### 결론적으로 이렇게 하시면 됩니다:
+
+1. `controller.py`의 `generate_events` 시작 부분에서 `await initialize_agent()`를 호출하세요.
+2. 만약 도구를 강제로 새로 고쳐야 하는 상황(예: 관리자 명령)이 온다면 `await initialize_agent(force_refresh=True)`를 호출하면 됩니다.
+3. 기존의 `refresh_agent_tools` 함수는 과감히 삭제하거나, 내부에서 `initialize_agent(force_refresh=True)`를 호출하도록 리팩토링하세요.
+
+이렇게 하면 훨씬 견고한 시스템이 됩니다. 이제 `agent.py`의 전체 코드를 이 구조에 맞춰서 확정 지어 드릴까요? 아니면 바로 컨트롤러 로직 수정으로 넘어갈까요?
+
+-----
+
 전문가로서 상황을 다시 진단해 드립니다. 현재 겪고 계신 문제는 **"비동기 초기화가 완료되지 않은 상태에서 동기식(Sync) 코드가 에이전트를 참조하려 할 때"** 발생하는 전형적인 의존성 순서 문제입니다.
 
 특히 `orchestrator` 등에서 모듈 임포트 시점에 `get_agent()`를 호출하면, 부팅 시 `await`가 완료되기 전이라 에러가 날 수밖에 없습니다. 이를 해결하기 위해 **FastAPI의 Lifespan을 통해 실행 순서를 강제**하고, **컨트롤러 호출 직전에 도구를 한 번 더 체크**하는 로직을 결합해야 합니다.
