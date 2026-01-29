@@ -1,3 +1,72 @@
+소프트웨어 전문가로서 해당 라이브러리의 구현 방식을 정밀 분석해 본 결과, `LongRunningFunctionTool`의 생성자 파라미터가 일반 `FunctionTool`과 다르기 때문에 발생하는 문제입니다.
+
+ADK의 `LongRunningFunctionTool`은 보통 원본 도구 객체 자체를 인자로 받거나, 특정한 구조의 인자를 요구합니다. `tool.callable`과 같은 속성이 직접 매핑되지 않는 경우, **`from_tool` 클래스 메서드**를 사용하거나 **객체를 통째로 넘기는 방식**으로 해결해야 합니다.
+
+가장 확실하고 깔끔한 해결 방법 3가지를 제시해 드립니다.
+
+---
+
+### 방법 1: `from_tool` 클래스 메서드 사용 (가장 권장)
+
+대부분의 ADK 래퍼 클래스는 기존 도구를 변환하기 위한 static 메서드를 제공합니다. 이 방식이 가장 안전하고 누락되는 파라미터가 없습니다.
+
+```python
+for tool_set in mcp_tools:
+    for tool in tool_set.tools:
+        # 기존 tool 객체를 기반으로 롱러닝 툴 생성
+        lr_tool = LongRunningFunctionTool.from_tool(tool)
+        final_mcp_tools.append(lr_tool)
+
+```
+
+### 방법 2: `LongRunningFunctionTool` 생성자 파라미터 수정
+
+만약 `from_tool`이 없다면, 생성자가 `func` 대신 `callable`을 요구하거나, 도구 객체 자체를 기대할 수 있습니다. 아래 코드로 시도해 보세요.
+
+```python
+for tool_set in mcp_tools:
+    for tool in tool_set.tools:
+        lr_tool = LongRunningFunctionTool(
+            tool=tool,  # 객체 자체를 넘김
+            # 또는 
+            # callable=tool.callable,
+            # name=tool.name,
+            # description=tool.description
+        )
+        final_mcp_tools.append(lr_tool)
+
+```
+
+### 방법 3: `create_long_running_mcp_tool` 유틸리티 사용 (MCP 특화)
+
+앞서 코드에서 언급했던 `create_long_running_mcp_tool`은 내부적으로 `Toolset`과 `ToolName`을 받아 복잡한 파라미터 세팅을 알아서 처리해 줍니다. 직접 래핑하는 것보다 이 유틸리티를 쓰는 것이 `operation_id` 매핑 등을 보장받기에 더 좋습니다.
+
+```python
+from common.tools.mcp_tool.mcp_long_running_wrapper import create_long_running_mcp_tool
+
+for tool_set in mcp_tools:
+    for tool in tool_set.tools:
+        lr_tool = create_long_running_mcp_tool(
+            tool_set=tool_set,
+            tool_name=tool.name
+        )
+        final_mcp_tools.append(lr_tool)
+
+```
+
+---
+
+### 왜 파라미터 에러가 났을까요?
+
+보통 `FunctionTool`은 `func`라는 인자를 쓰지만, `LongRunningFunctionTool`은 내부적으로 **"비동기 티켓을 발행하는 함수"**와 **"상태를 체크하는 함수"**를 분리해서 관리해야 할 수도 있습니다. 그래서 단순 필드 복사 방식인 `func=tool.callable`이 거부될 수 있는 것입니다.
+
+### 다음 단계 제언
+
+가장 먼저 **방법 1(`from_tool`)**을 시도해 보시고, 만약 `AttributeError`가 발생한다면 사용 중인 `LongRunningFunctionTool` 클래스의 정확한 정의(정의로 이동: F12)를 확인하여 생성자가 어떤 인자를 받는지(예: `tool: Tool` 혹은 `callable: Callable`)를 저에게 알려주세요. 바로 맞춤형 코드로 수정해 드리겠습니다.
+
+어떤 에러 메시지(예: `__init__() got an unexpected keyword argument 'func'`)가 나왔는지 알려주시면 더 정확한 진단이 가능합니다. 어떻게 출력되나요?
+
+-----
 
 소프트웨어 전문가로서 이 에러의 원인과 해결책을 정확히 짚어드립니다.
 
