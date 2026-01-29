@@ -1,3 +1,93 @@
+
+소프트웨어 전문가로서, LongRunningFunctionTool을 직접 상속받아 사용자님의 의도대로 is_long_running 플래그와 MCP 실행 로직을 통합한 커스텀 클래스를 설계해 드립니다.
+이 방식의 장점은 래핑 과정 없이 객체 생성 시점에 이미 롱러닝 도구로 확정된다는 것입니다.
+1. 커스텀 롱러닝 MCP 도구 클래스 설계
+이 클래스는 LongRunningFunctionTool을 상속받으면서, 내부적으로 MCP Toolset의 실행 권한을 가집니다.
+from typing import Any, Callable, Optional
+from google.adk.tools import LongRunningFunctionTool
+from common.logger import logger
+
+class McpLongRunningTool(LongRunningFunctionTool):
+    """
+    LongRunningFunctionTool을 상속받아 
+    MCP 실행 로직과 롱러닝 플래그를 통합한 클래스
+    """
+    def __init__(
+        self,
+        tool_set: Any,
+        tool_name: str,
+        description: Optional[str] = None,
+        estimated_duration: int = 300,  # 기본 5분
+        tool_timeout: int = 600         # 기본 10분
+    ):
+        # 1. 원본 MCP 툴 찾기
+        original_tool = next((t for t in tool_set.tools if t.name == tool_name), None)
+        if not original_tool:
+            raise ValueError(f"Tool '{tool_name}' not found in the provided tool_set.")
+
+        # 2. 부모 클래스(LongRunningFunctionTool) 초기화
+        # 여기서 func는 MCP 실행을 대행하는 callable이어야 합니다.
+        super().__init__(
+            func=original_tool.callable,
+            name=tool_name,
+            description=description or original_tool.description
+        )
+
+        # 3. 롱러닝 핵심 속성 설정 (오버라이딩 및 확장)
+        self.is_long_running = True
+        self.estimated_duration = estimated_duration
+        self.tool_timeout = tool_timeout
+        self._tool_set = tool_set  # 참조 유지
+
+        logger.info(f"Custom McpLongRunningTool created: {tool_name} (is_long_running={self.is_long_running})")
+
+    async def __call__(self, *args, **kwargs) -> Any:
+        """
+        도구 호출 시 실행되는 로직. 
+        일반적으로 부모의 callable을 실행하지만 필요시 전후 처리를 오버라이딩할 수 있습니다.
+        """
+        return await super().__call__(*args, **kwargs)
+
+2. agent.py에서 이 클래스를 사용하는 방법
+이제 wrap_mcp_tools 함수 대신, 발견된 도구들을 위 클래스의 인스턴스로 생성하여 리스트에 담아주기만 하면 됩니다.
+def create_agent_with_custom_tools(toolsets: List[Any]) -> Agent:
+    final_tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+        check_mcp_operation_status_tool,
+    ]
+
+    for toolset in toolsets:
+        for tool in toolset.tools:
+            # 롱러닝 대상인지 확인 (이전 필터링 로직 활용)
+            if any(tool.name.startswith(p) for p in ALLOW_LIST):
+                # 우리가 만든 상속 클래스로 인스턴스화
+                lr_tool = McpLongRunningTool(
+                    tool_set=toolset,
+                    tool_name=tool.name
+                )
+                final_tools.append(lr_tool)
+            else:
+                # 일반 도구는 그대로 추가
+                final_tools.append(tool)
+
+    return Agent(
+        name="device_info",
+        tools=final_tools,
+        instruction=INSTRUCTION
+        # ... 기타 설정 동일
+    )
+
+3. 왜 이 방식이 더 강력한가?
+ * 타입 일치 (Type Safety): ADK Runner가 isinstance(tool, LongRunningFunctionTool)를 체크할 때 이 클래스는 항상 True를 반환하므로 롱러닝 프로토콜이 완벽하게 작동합니다.
+ * 명시적 속성 제어: estimated_duration 같은 롱러닝 전용 파라미터를 클래스 내부에서 명시적으로 관리할 수 있어 코드가 더 직관적입니다.
+ * 확장성: 만약 나중에 특정 MCP 도구의 실행 전후에 로깅을 남기거나 에러 처리를 다르게 해야 한다면, __call__ 메서드만 오버라이딩하면 됩니다.
+최종 제언
+이 클래스 구조를 사용하면 사용자님께서 원하셨던 **"클래스 오버라이딩을 통한 롱러닝 구현"**이 ADK 프레임워크의 규칙을 깨지 않으면서도 가장 깔끔하게 완성됩니다.
+이 클래스 정의를 agent.py에 포함하여 전체 코드를 다시 정리해 드릴까요? 아니면 이 클래스를 별도의 유틸리티 파일로 분리하는 것이 편하실까요?
+
+
+
 전문가로서 명쾌하게 답변드립니다. **네, 대체하셔도 됩니다. 아니, 오히려 `initialize_agent`로 대체하시는 것이 아키텍처적으로 훨씬 우수하고 안정적입니다.**
 
 기존의 `refresh_agent_tools` 방식과 현재의 `initialize_agent` 방식은 **"도구를 최신화한다"**는 목적은 같지만, **"어떻게 최신화하느냐"**에서 큰 차이가 있습니다. 왜 대체하는 것이 유리한지 3가지 이유로 정리해 드립니다.
