@@ -1,4 +1,166 @@
 
+소프트웨어 전문가로서 질문하신 두 가지 핵심 포인트(클래스 속성 설계와 도구 로드 타이밍 문제)를 자바 아키텍처 관점에서 정밀하게 분석해 드립니다.
+
+### 1. `is_long_running` 변수가 왜 안 먹히나요? (Type vs Property)
+
+사용자께서 `is_long_running=True`라고 설정을 해도 작동하지 않는 이유는 ADK Runner의 내부 구현 방식 때문입니다.
+
+* **Java 비유**: 자바에서 특정 클래스를 직렬화하려면 단순히 `boolean isSerializable = true;`라고 변수를 만드는 게 아니라, `implements Serializable`이라는 **인터페이스(Marker Interface)**를 선언해야 하는 것과 같습니다.
+* **ADK 내부 로직**: ADK의 `Runner`는 이벤트를 생성할 때 `if tool.is_long_running:`이라고 체크하는 것이 아니라, **`if isinstance(tool, LongRunningFunctionTool):`**이라고 체크합니다.
+* **결론**: 즉, 단순한 변수(Attribute)가 아니라 **객체의 타입(Class Type)** 자체가 `LongRunningFunctionTool`이어야만 Runner가 "아, 이 툴은 롱러닝 이벤트를 던져야 하는구나"라고 인식하여 `long_running_tool_ids`를 생성합니다.
+
+---
+
+### 2. MCP 도구 로드 타이밍 문제 (Discovery Timing Gap)
+
+`create_agent()` 시점에 MCP 서버와의 연결이 불안정하거나 도구가 다 로드되지 않아 래핑이 누락되는 문제는 실제 운영 환경에서 매우 자주 발생하는 **Race Condition**입니다.
+
+이 문제를 해결하기 위해 사용자께서 말씀하신 **Post-processing(사후 처리)** 방식이 정답입니다. 두 가지 전략이 있습니다.
+
+#### 전략 A: Lazy Wrapping (권장)
+
+`get_tools` 함수 내부에서 도구를 발견할 때마다 즉시 `LongRunningFunctionTool`로 변환하여 반환하도록 `get_tools` 자체를 수정하는 방법입니다.
+
+#### 전략 B: Runtime Refresh (동적 갱신)
+
+에이전트가 실행되기 직전(Controller 레이어)에 도구 목록을 다시 확인하고, 래핑되지 않은 도구가 있다면 그 시점에 래핑하여 에이전트의 `tool_map`을 갱신합니다.
+
+---
+
+### 3. 최종 수정 코드 가이드 (Official Doc 스타일 적용)
+
+사용자께서 주신 공식 문서 스니펫과 현재의 타이밍 문제를 동시에 해결하는 구조입니다.
+
+#### `agent.py`: 래핑 로직을 `get_tools`와 결합
+
+`get_tools`가 이미 래핑된 도구들을 반환하도록 하거나, 아래처럼 `create_agent`에서 확실하게 래핑을 보장해야 합니다.
+
+```python
+# agents/device_info/agent.py
+
+def create_agent():
+    name = "device_info"
+    allow_list = ["get", "get_", "list_", "read_", "check_", "usp_", "kai-"]
+    
+    # get_tools should be configured to return or allow wrapping
+    # If get_tools doesn't support it, we wrap manually
+    mcp_tools = get_tools(
+        server_list_env_vars=["KCS_MCP_SERVER_LIST"],
+        allow_list=allow_list,
+        require_confirmation=False,
+        header_provider=header_provider,
+    )
+
+    # Manual wrapping for existing tools
+    # Ensure every MCP tool is an instance of LongRunningFunctionTool
+    final_mcp_tools = []
+    for tool_set in mcp_tools:
+        for tool in tool_set.tools:
+            # Wrap standard tool into LongRunningFunctionTool
+            lr_tool = LongRunningFunctionTool(
+                func=tool.callable,
+                name=tool.name,
+                description=tool.description
+            )
+            final_mcp_tools.append(lr_tool)
+
+    tools = [
+        convert_timestamp_to_datetime,
+        load_compacted_response,
+    ]
+    tools.extend(final_mcp_tools)
+
+    return Agent(
+        name=name,
+        tools=tools,
+        instruction=INSTRUCTION
+    )
+
+```
+
+#### `controller.py`: 공식 문서 패턴 적용 (Polled Result Injection)
+
+```python
+# controller.py
+
+async def call_agent_async(query):
+    # Helper to detect long running calls
+    def get_long_running_function_call(event: Event):
+        if not event.long_running_tool_ids or not event.content or not event.content.parts:
+            return None
+        for part in event.content.parts:
+            if (part.function_call and 
+                event.long_running_tool_ids and 
+                part.function_call.id in event.long_running_tool_ids):
+                return part.function_call
+        return None
+
+    # Helper to detect intermediate responses
+    def get_function_response(event: Event, function_call_id: str):
+        if not event.content or not event.content.parts:
+            return None
+        for part in event.content.parts:
+            if (part.function_response and 
+                part.function_response.id == function_call_id):
+                return part.function_response
+        return None
+
+    content = types.Content(role='user', parts=[types.Part(text=query)])
+    session, runner = await setup_session_and_runner()
+
+    # Initial Run
+    events_async = runner.run_async(
+        session_id=session.id, user_id=USER_ID, new_message=content
+    )
+
+    last_fc, last_fr = None, None
+    async for event in events_async:
+        if not last_fc:
+            last_fc = get_long_running_function_call(event)
+        else:
+            potential_res = get_function_response(event, last_fc.id)
+            if potential_res:
+                last_fr = potential_res
+
+        # Immediate streaming output
+        if event.content and event.content.parts:
+            if text := ''.join(part.text or '' for part in event.content.parts):
+                print(f'[{event.author}]: {text}')
+
+    # Final Result Injection (The core of the official doc pattern)
+    if last_fr:
+        # Get operation ID from intermediate response
+        op_id = last_fr.response.get('operation_id') or last_fr.response.get('ticket-id')
+        
+        # Poll for actual result
+        final_result = await poll_mcp_result(op_id)
+
+        # Create updated response matching the required schema
+        updated_response = last_fr.model_copy(deep=True)
+        updated_response.response = {"result": final_result}
+
+        # Second run to give the final answer
+        async for event in runner.run_async(
+            session_id=session.id, 
+            user_id=USER_ID, 
+            new_message=types.Content(parts=[types.Part(function_response=updated_response)], role='user')
+        ):
+            if event.content and event.content.parts:
+                if text := ''.join(part.text or '' for part in event.content.parts):
+                    print(f'[{event.author}]: {text}')
+
+```
+
+### 요약 및 제언
+
+1. **변수(`is_long_running`)가 아닌 클래스 타입(`LongRunningFunctionTool`)**을 사용해야 ADK Runner가 정상적으로 이벤트를 분리합니다.
+2. **Timing Issue**는 `create_agent` 시점에 도구가 없으면 발생합니다. 만약 MCP 도구가 계속 늦게 로드된다면, `controller.py` 시작 부분에서 `await check_mcp_tools_status()`를 명시적으로 호출하여 도구 로드를 강제한 후 래핑을 진행하는 **Pre-execution Sync** 방식을 추천합니다.
+
+이제 이 구조로 `LongRunningFunctionTool` 객체를 생성해서 돌려보시겠어요? 드디어 `long_running_tool_ids`가 로그에 찍히는 것을 보실 수 있을 겁니다.
+
+Would you like me to look into how to specifically force the MCP tool discovery to finish before the agent is initialized?
+
+--------
 
 
 소프트웨어 전문가의 시선으로, 올려주신 로직의 핵심인 ADK(Agent Development Kit) Event의 흐름을 중심으로 상세히 설명해 드리겠습니다.
