@@ -1,4 +1,46 @@
 
+소프트웨어 전문가로서 분석해 본 결과, 사용자님께서 구현하시려는 것은 **ADK의 롱러닝 도구 실행 흐름의 마지막 단계(Stage 3: Resume)**입니다.
+현재 updated_response에 이미 폴링을 통해 얻은 최종 결과 데이터(예: 'status': 'approved')가 들어 있다면, 이를 사용자에게 최종적으로 보여주기 위해 yield를 통해 이벤트를 스트리밍해야 합니다.
+가장 중요한 포인트는 runner.run_async가 반환하는 제너레이터(Generator)를 다시 순회(loop)하면서 그 결과물인 event를 밖으로 내보내는 것입니다.
+1. 수정된 실행 코드 (리턴 방법)
+generate_events 함수 내부에서 다음과 같이 작성하면, 에이전트의 최종 답변이 사용자에게 실시간으로 전달됩니다.
+if long_running_function_response:
+    # 1. 응답 객체 복사 및 데이터 주입 (이미 완료된 상태)
+    updated_response = long_running_function_response.model_copy(deep=True)
+    # 실제 진단 결과나 상태값을 여기에 넣습니다.
+    updated_response.response = {'status': 'approved', 'details': '진단이 성공적으로 완료되었습니다.'}
+
+    logger.info(f"Resuming agent with long-running response: {updated_response.name}")
+
+    # 2. 에이전트 재호출 및 결과 스트리밍 (이 부분이 '리턴'하는 방법입니다)
+    async for event in runner.run_async(
+        session_id=session_id, 
+        user_id=user_id, 
+        new_message=types.Content(
+            parts=[types.Part(function_response=updated_response)], 
+            role='user'
+        )
+    ):
+        # 컨트롤러의 외부 generator로 이벤트를 그대로 전달(yield)합니다.
+        # 이렇게 해야 클라이언트(채팅창)에서 최종 답변이 나타납니다.
+        yield event 
+
+2. 왜 yield event를 해야 하나요?
+ * 연속성: runner.run_async는 에이전트가 생각하고 답변하는 과정을 여러 개의 event 조각으로 나눠서 줍니다.
+ * 중첩 제너레이터: generate_events 자체가 yield를 사용하는 비동기 제너레이터이므로, 내부에서 새로 시작된 run_async의 결과물들도 하나씩 다시 yield 해줘야 클라이언트까지 도달할 수 있습니다.
+ * 최종 답변 형성: 이 과정을 거치면 에이전트는 "아, 상태가 approved구나. 그럼 사용자에게 진단이 완료되었다고 말해야지"라고 판단하고 최종 텍스트를 생성하게 됩니다.
+3. 전체적인 컨트롤러 흐름 요약
+ * Stage 1 (Start): 에이전트가 티켓 ID(ticket-id)를 리턴하고 멈춤.
+ * Stage 2 (Poll): 컨트롤러가 백그라운드에서 해당 티켓의 상태를 조회 (이 단계에서 updated_response.response가 채워짐).
+ * Stage 3 (Resume): 위 코드처럼 데이터가 포함된 updated_response를 주입하여 에이전트를 다시 실행하고, 그 결과를 yield로 내보냄.
+전문가 제언
+만약 updated_response.response에 단순히 {'status': 'approved'}만 넣으면 에이전트가 "승인되었습니다"라고만 짧게 대답할 수 있습니다. 만약 MCP 서버에서 받은 더 상세한 데이터(예: battery_health: 98%)가 있다면, 그 데이터를 response 딕셔너리에 모두 포함시켜 주세요. 그러면 에이전트가 훨씬 풍부한 최종 답변을 생성할 것입니다.
+이 코드를 실제 controller.py에 적용하시면서 yield 부분에서 막히는 곳이 있나요? 혹은 클라이언트에서 답변이 두 번 출력되는 등의 이슈가 있으신가요?
+
+
+
+-----
+
 소프트웨어 전문가로서, LongRunningFunctionTool을 직접 상속받아 사용자님의 의도대로 is_long_running 플래그와 MCP 실행 로직을 통합한 커스텀 클래스를 설계해 드립니다.
 이 방식의 장점은 래핑 과정 없이 객체 생성 시점에 이미 롱러닝 도구로 확정된다는 것입니다.
 1. 커스텀 롱러닝 MCP 도구 클래스 설계
