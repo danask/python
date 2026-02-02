@@ -1,4 +1,131 @@
 
+
+소프트웨어 전문가로서 컨트롤러 코드를 정밀 분석한 결과, 현재 두 가지 핵심적인 병목 현상이 발생하고 있습니다.
+
+1. **중간 응답 누락**: `generate_events` 루프 내에서 `long_running_function_call`이 감지된 순간부터 로직이 ID를 찾는 데 집중하느라 일반 텍스트 이벤트를 `yield` 하는 흐름이 끊길 수 있습니다.
+2. **스키마 에러**: 롱러닝 도구의 반환 객체가 `json.loads`를 통과하지 못해 `JSONDecodeError`가 발생하거나, 비어있는 `part`를 참조할 때 에러가 납니다.
+
+이를 해결하기 위해 **`EventResponseFormatter`를 보강**하고, `generate_events`의 **이벤트 소비 루프를 더욱 견고하게** 수정해야 합니다.
+
+---
+
+### 1. `EventResponseFormatter` 수정: 안전한 텍스트 추출
+
+중간 과정이 JSON이 아닐 때 에러가 나지 않도록 하고, 롱러닝 관련 파트는 사용자에게 친절한 텍스트로 변환해 줍니다.
+
+```python
+class EventResponseFormatter:
+    """이벤트 응답 타입을 안전하게 포맷팅합니다."""
+
+    @staticmethod
+    def format_text(part: dict) -> str:
+        text_content = part.get("text", "")
+        if not text_content: return ""
+
+        # JSON 파싱 시도하되, 실패해도 에러를 던지지 않고 텍스트 그대로 반환
+        try:
+            # 단순히 검증만 하고 원본 텍스트 반환 (나중에 parse_to_schema에서 처리)
+            json.loads(text_content)
+            return text_content 
+        except (json.JSONDecodeError, TypeError):
+            return text_content
+
+    @staticmethod
+    def format_function_call(part: dict) -> str:
+        # 도구 호출 시 중간 진행 상황을 사용자에게 알림
+        f_call = part.get("functionCall", {})
+        name = f_call.get("name", "Unknown Task")
+        return f"🔄 [System] {name} 작업을 시작합니다..."
+
+    @staticmethod
+    def format_function_response(part: dict) -> str:
+        # 도구 결과 수신 시 진행 상황 알림
+        f_resp = part.get("functionResponse", {})
+        name = f_resp.get("name", "")
+        return f"⚙️ [System] {name} 분석 완료. 다음 단계를 준비합니다..."
+
+```
+
+---
+
+### 2. `generate_events` 수정: 실시간 `yield` 보장
+
+롱러닝 ID를 찾는 로직과 사용자에게 텍스트를 `yield` 하는 로직이 **병렬로 작동**하도록 구조를 개선합니다.
+
+```python
+async def generate_events(
+    runner: Any, content: types.Content, user_id: str, session_id: str
+) -> AsyncGenerator[str]:
+    try:
+        # Stage 1 & 2 실행
+        events_async = runner.run_async(...)
+
+        long_running_function_call = None
+        long_running_function_response = None
+
+        async for event in events_async:
+            # 1. 텍스트 추출 및 즉시 yield (중간 응답 보장)
+            response_text = get_response_text_from_event(event)
+            if response_text:
+                # 롱러닝 진행 중이라도 텍스트가 있으면 무조건 보냄
+                yield f"{response_text}\n\n"
+
+            # 2. 롱러닝 ID 감지 로직 (내부적으로만 수행)
+            if not long_running_function_call:
+                long_running_function_call = get_long_running_function_call(event)
+            else:
+                potential = get_function_response(event, long_running_function_call.id)
+                if potential:
+                    long_running_function_response = potential
+
+        # 3. 롱러닝 도구 완료 후 Resume (Stage 3)
+        if long_running_function_response:
+            logger.info("[RESUME] Starting final analysis with tool data")
+            
+            # 여기서 실제 롱러닝 결과를 주입 (status를 결과 데이터로 교체했다고 가정)
+            updated_response = long_running_function_response.model_copy(deep=True)
+            # updated_response.response = {"result": ...} # 실제 데이터 주입
+
+            async for event in runner.run_async(
+                session_id=session_id,
+                user_id=user_id,
+                new_message=types.Content(
+                    parts=[types.Part(function_response=updated_response)], role="user"
+                ),
+            ):
+                # 최종 응답 추출
+                final_text = get_response_text_from_event(event)
+                if final_text:
+                    # 최종 답변이 turn_complete 시점이라면 스키마로 변환 시도
+                    if event.turn_complete:
+                        schema_data = parse_response_to_schema(final_text)
+                        # JSON 형식으로 최종 응답
+                        yield f"data: {json.dumps(schema_data.model_dump(), ensure_ascii=False)}\n\n"
+                    else:
+                        # 최종 답변 생성 중 나오는 일반 텍스트
+                        yield f"{final_text}\n\n"
+
+    except Exception as e:
+        logger.exception(f"Error: {e}")
+        yield get_error_response(e)
+
+```
+
+---
+
+### 3. 주요 개선 포인트 요약
+
+* **실시간성 확보**: `if event.turn_complete` 조건 밖에서도 `get_response_text_from_event`를 호출하여 텍스트가 생길 때마다 즉시 `yield` 합니다. 이를 통해 "분석 중입니다..." 같은 중간 메시지가 화면에 바로 나타납니다.
+* **에러 방지**: `EventResponseFormatter`에서 `json.loads` 실패를 무시하게 하여, 중간의 일반 텍스트 응답이 들어올 때 시스템이 멈추지 않도록 했습니다.
+* **SSE 규격 준수**: 최종 스키마를 보낼 때는 `data: ...` 접두사를 붙여 프런트엔드에서 SSE 이벤트로 정확히 인식하게 했습니다.
+
+### 추가 팁: `turn_complete` 활용
+
+ADK 3.0 이상에서는 `event.turn_complete`가 `True`일 때가 에이전트가 "완전히 생각을 마친" 시점입니다. 이때만 `parse_response_to_schema`를 태워야 불완전한 JSON 파싱 에러를 막을 수 있습니다.
+
+이제 이 구조를 적용해 보시면 중간 메시지는 자연스럽게 흐르고, 마지막에는 깔끔한 JSON 스키마 결과를 얻으실 수 있을 겁니다. 바로 테스트해 보시겠어요?
+
+----
 소프트웨어 전문가로서 분석해 드릴게요. `Long-Running Tool`이 개입되면 이벤트 스트림에는 **텍스트(최종 응답)**, **함수 호출(Function Call)**, **함수 결과(Function Response)** 등 다양한 데이터가 섞여 들어옵니다.
 
 최종 응답이 스키마(JSON) 형식이라면, ADK는 이를 `event.content.parts` 내의 **`text`** 필드에 담아서 보냅니다. 따라서 **"도구 호출 관련 이벤트는 무시하고, 실제 텍스트 내용이 포함된 이벤트만 골라내어 스키마(JSON) 파싱을 시도"**하는 로직이 필요합니다.
