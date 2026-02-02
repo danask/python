@@ -1,4 +1,90 @@
+전문가로서 FE(Front-End)로 데이터가 전달되지 않는 이유를 정확히 짚어드리겠습니다.
 
+현재 코드에서 **"로그에는 찍히는데 FE에는 안 나오는"** 가장 큰 이유는 **SSE(Server-Sent Events)의 규격(`data: ` 접두사와 `\n\n` 종료문자)** 때문입니다. FE의 `EventSource`나 `fetch` 스트림 라이브러리는 특정 형식을 갖추지 않은 텍스트는 이벤트로 인식하지 않고 무시합니다.
+
+또한, `FastAPI`의 `StreamingResponse`는 `yield`하는 문자열이 즉시 전송되도록 보장해야 하는데, 버퍼링이 걸려있을 가능성도 있습니다.
+
+---
+
+### 1. SSE 포맷 강제 (가장 유력한 원인)
+
+FE에서 데이터를 받으려면 모든 `yield` 값은 `data: `로 시작하고 `\n\n`으로 끝나야 합니다.
+
+#### `get_response_text_from_event` 수정
+
+```python
+def get_response_text_from_event(event: Any) -> str:
+    # ... (기존 로직 동일) ...
+
+    if formatted_response:
+        # FE가 인식할 수 있는 SSE 포맷으로 감쌉니다.
+        # json_data = json.dumps({"author": agent_author, "message": formatted_response}, ensure_ascii=False)
+        # return f"data: {json_data}\n\n" 
+        
+        # 만약 단순 텍스트로 보낸다면:
+        return f"data: **{agent_author}**: {formatted_response}\n\n"
+
+    return ""
+
+```
+
+### 2. `generate_events` 루프 내 `yield` 로직 점검
+
+현재 `generate_events`에서 `response_text`를 `yield` 할 때 접두사가 빠져있거나, `\n` 개수가 부족하면 FE는 스트림이 끝날 때까지 기다리느라 화면에 뿌려주지 않습니다.
+
+```python
+async def generate_events(runner, content, user_id, session_id):
+    try:
+        async for event in runner.run_async(...):
+            # 1. 중간 응답 추출
+            response_text = get_response_text_from_event(event)
+            
+            if response_text:
+                # 여기서 response_text는 이미 "data: ... \n\n" 형태여야 함
+                logger.info(f"[YIELDING TO FE]: {response_text}")
+                yield response_text  # 이제 FE 스트림에 잡힙니다.
+            
+            # ... (롱러닝 핸들링 로직) ...
+
+```
+
+### 3. `Long-Running Tool` 실행 시의 공백기 해결
+
+롱러닝 도구가 실행되는 동안(`while` 폴링 등) 아무런 `yield`가 없으면 연결이 끊긴 것으로 간주될 수 있습니다.
+
+#### 폴링 중 "하트비트" 또는 "진행 상태" 전송
+
+```python
+        if long_running_function_response:
+            # 롱러닝 티켓을 받았음을 FE에 즉시 알림
+            yield f"data: {json.dumps({'status': 'processing', 'message': '장비 정보를 조회 중입니다...'})}\n\n"
+
+            # (Resume 후 발생하는 이벤트들도 동일하게 data: 포맷 유지)
+            async for event in runner.run_async(...):
+                final_text = get_response_text_from_event(event)
+                if final_text:
+                    yield final_text # "data: ... \n\n"
+
+```
+
+---
+
+### 4. 체크리스트 (FE가 못 받는 이유)
+
+1. **Prefix 확인**: 모든 출력 앞에 `data: `가 붙어 있나요?
+2. **Suffix 확인**: 모든 출력 끝에 `\n\n` (뉴라인 두 개)가 있나요?
+3. **Media Type**: `_handle_chat_request`에서 `media_type=MEDIA_TYPE_SSE` (즉, `text/event-stream`)가 정확히 설정되어 있나요?
+4. **FE 구현**: FE에서 `EventSource`를 쓰시나요, 아니면 `fetch`를 쓰시나요? `fetch`를 쓴다면 `ReadableStream`을 바디에서 직접 읽고 있는지 확인이 필요합니다.
+
+### 해결책 요약
+
+`EventResponseFormatter` 결과물을 로그로만 보지 마시고, **`data: {"text": "..."}\n\n`** 같은 구조로 직렬화해서 던져보세요.
+
+가장 먼저 `get_response_text_from_event`의 리턴값을 `f"data: {formatted_response}\n\n"`으로 바꿔서 테스트해보시겠어요? FE 콘솔에 데이터가 찍히기 시작할 겁니다.
+
+FE 쪽에서 데이터를 어떻게 받고 있는지(`fetch` 코드 등)를 보여주시면 그에 맞는 맞춤형 포맷팅을 바로 짜드릴 수 있습니다. 어떻게 되어 있나요?
+
+----
 
 소프트웨어 전문가로서 컨트롤러 코드를 정밀 분석한 결과, 현재 두 가지 핵심적인 병목 현상이 발생하고 있습니다.
 
