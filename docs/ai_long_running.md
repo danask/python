@@ -1,4 +1,189 @@
 
+소프트웨어 전문가로서 분석해 드릴게요. `Long-Running Tool`이 개입되면 이벤트 스트림에는 **텍스트(최종 응답)**, **함수 호출(Function Call)**, **함수 결과(Function Response)** 등 다양한 데이터가 섞여 들어옵니다.
+
+최종 응답이 스키마(JSON) 형식이라면, ADK는 이를 `event.content.parts` 내의 **`text`** 필드에 담아서 보냅니다. 따라서 **"도구 호출 관련 이벤트는 무시하고, 실제 텍스트 내용이 포함된 이벤트만 골라내어 스키마(JSON) 파싱을 시도"**하는 로직이 필요합니다.
+
+### 개선된 로직: 텍스트 및 스키마 추출 방법
+
+핵심은 `event.content.parts`를 순회할 때 `part.text`가 존재하는지 확인하고, 그것이 유효한 JSON인지 체크하는 것입니다.
+
+```python
+import json
+
+async def call_agent_async(query):
+    # ... (상단 Helper 함수 및 초기화 로직은 동일) ...
+
+    # [Stage 1] 에이전트 첫 실행
+    events_async = runner.run_async(...)
+
+    long_running_function_call = None
+    long_running_function_response = None
+    final_json_response = None # 최종 스키마를 담을 변수
+
+    async for event in events_async:
+        # 1. 롱러닝 도구 호출 감지
+        if not long_running_function_call:
+            long_running_function_call = get_long_running_function_call(event)
+        
+        # 2. 텍스트 파트 처리 (스키마 응답 포함)
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                # 함수 호출/응답 파트는 건너뛰고 오직 'text'가 있는 경우만 처리
+                if part.text:
+                    clean_text = part.text.strip()
+                    print(f'[{event.author}]: {clean_text}')
+                    
+                    # 만약 최종 응답이 스키마(JSON)라면 여기서 파싱 시도
+                    try:
+                        # 텍스트가 { 로 시작한다면 JSON일 확률이 높음
+                        if clean_text.startswith('{') or clean_text.startswith('['):
+                            final_json_response = json.loads(clean_text)
+                    except json.JSONDecodeError:
+                        # 일반 텍스트 대화인 경우 무시
+                        pass
+
+        # 3. 롱러닝 티켓 ID 획득 (위의 로직 유지)
+        if long_running_function_call:
+            _potential_response = get_function_response(event, long_running_function_call.id)
+            if _potential_response:
+                long_running_function_response = _potential_response
+                # 티켓 ID 추출 로직...
+
+    # [Stage 2 & 3] 롱러닝 결과 주입 및 최종 실행
+    if long_running_function_response:
+        # (폴링 로직 생략 - status: approved 상태의 데이터를 가져왔다고 가정)
+        updated_response = long_running_function_response.model_copy(deep=True)
+        updated_response.response = {'status': 'success', 'data': '실제 진단 결과'} 
+
+        print("\nResuming agent with long-running result...")
+        async for event in runner.run_async(
+            session_id=session.id, 
+            user_id=USER_ID, 
+            new_message=types.Content(parts=[types.Part(function_response=updated_response)], role='user')
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        # 최종 단계에서도 스키마(JSON) 파싱 시도
+                        try:
+                            final_json_response = json.loads(part.text)
+                            print(f"[FINAL SCHEMA]: {final_json_response}")
+                        except json.JSONDecodeError:
+                            print(f'[{event.author}]: {part.text}')
+
+    return final_json_response
+
+```
+
+### 왜 이렇게 처리해야 하나요?
+
+1. **데이터 분리**: `Long-Running Tool`이 작동하는 동안 `part.function_call`이나 `part.function_response`가 포함된 이벤트가 발생합니다. 이들은 JSON 직렬화 시 모델 객체 형태라 에러를 유발하기 쉽습니다. `if part.text:`로 필터링하면 안전합니다.
+2. **스키마 확보의 유연성**: 롱러닝 작업이 시작되기 전(Stage 1)에 에이전트가 "잠시만 기다려주세요"라고 JSON으로 응답할 수도 있고, 모든 작업이 끝난 후(Stage 3)에 최종 결과를 JSON으로 줄 수도 있습니다. 위 로직은 어느 시점에서든 **텍스트 형태의 JSON**이 들어오면 가로챌 수 있습니다.
+3. **JSON 가공**: 에이전트가 마크다운 코드 블록(예: `json ... `)을 포함해서 대답할 경우를 대비해 `strip()`이나 정규표현식으로 정제하는 로직을 추가하면 더욱 견고해집니다.
+
+### 💡 팁: 더 깔끔한 처리를 원하신다면
+
+에이전트에게 보내는 `instruction`에 **"응답 시 텍스트 설명 없이 오직 JSON 스키마만 출력해라"**라고 명시하면 파싱 에러 확률을 크게 낮출 수 있습니다.
+
+이제 이 로직을 적용하면 도구 호출 과정의 노이즈는 무시하고, 사용자가 원하는 최종 결과(Schema)만 깔끔하게 추출할 수 있습니다. `final_json_response`를 활용해 다음 작업을 진행해 보시겠어요?
+
+
+전문가로서 답변드립니다. **네, 가능합니다.** 오히려 실무에서는 롱러닝 작업이 진행되는 동안 사용자에게 "현재 상태"를 정해진 스키마(JSON)에 맞춰 내려주는 것이 프런트엔드 연동을 위해 매우 중요합니다.
+
+이를 구현하려면 **`Stage 1(티켓 생성)`**과 **`Stage 3(최종 결과)`** 각각에서 서로 다른 JSON 응답을 기대하도록 로직을 설계해야 합니다.
+
+---
+
+### 1. 중간 상태와 최종 결과 스키마 구분
+
+보통 두 가지 형태의 JSON 응답이 발생합니다:
+
+* **중간 응답 (Intermediate)**: `{"status": "processing", "ticket_id": "123", "message": "장비 진단을 시작합니다."}`
+* **최종 응답 (Final)**: `{"status": "completed", "result": {...}, "summary": "진단 완료"}`
+
+### 2. 코드 구현 방법
+
+이전 코드에서 `final_json_response`를 처리하던 로직을 확장하여, **어느 시점에서든 JSON이 포착되면 즉시 처리**하도록 만들면 됩니다.
+
+```python
+async def call_agent_async(query):
+    # ... (초기화 및 Runner 설정 생략) ...
+
+    async def process_event_for_schema(event):
+        """이벤트에서 텍스트를 추출하고 JSON 스키마 여부를 확인하는 내부 함수"""
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if part.text:
+                    try:
+                        # 1. 텍스트 정제 (마크다운 코드 블록 제거 등)
+                        clean_text = part.text.strip().replace("```json", "").replace("```", "")
+                        data = json.loads(clean_text)
+                        
+                        # 2. 스키마에 따른 처리
+                        if data.get("status") == "processing":
+                            print(f"--- [중간 상태 알림] --- \nID: {data.get('ticket_id')}")
+                            # 여기서 프런트엔드로 SSE 등을 통해 중간 상태 전송 가능
+                        elif data.get("status") == "completed":
+                            print(f"--- [최종 결과 수신] --- \n결과: {data.get('result')}")
+                        
+                        return data # 파싱된 JSON 객체 반환
+                    except json.JSONDecodeError:
+                        pass
+        return None
+
+    # [Stage 1] 실행 및 중간 상태 포착
+    events_async = runner.run_async(...)
+    async for event in events_async:
+        # 중간 상태 JSON이 있다면 가로챔
+        intermediate_data = await process_event_for_schema(event)
+        
+        # 롱러닝 티켓 핸들링 (이전 로직 유지)
+        if not long_running_function_call:
+            long_running_function_call = get_long_running_function_call(event)
+        # ... (생략) ...
+
+    # [Stage 3] 폴링 후 최종 실행
+    if long_running_function_response:
+        # (폴링으로 실제 데이터 가져온 후)
+        async for event in runner.run_async(...):
+            # 최종 결과 JSON 포착
+            final_data = await process_event_for_schema(event)
+
+```
+
+---
+
+### 3. 성공적인 구현을 위한 팁
+
+1. **System Instruction 보강**: 에이전트에게 상황별 응답 형식을 명확히 지시해야 합니다.
+> "롱러닝 도구를 실행하기 직전에는 반드시 `status: processing` 스키마로 응답하고, 도구 결과가 주입된 후에는 `status: completed` 스키마로 응답해."
+
+
+2. **Partial JSON 처리**: 에이전트가 응답을 생성하는 도중(Streaming)에는 JSON이 완성되지 않아 파싱 에러가 날 수 있습니다. 이 경우 `json.loads`를 시도하기 전에 해당 이벤트가 스트림의 마지막(`done`)인지 확인하거나, 예외 처리를 꼼꼼히 해야 합니다.
+3. **스키마 유효성 검사 (Pydantic)**: `json.loads`로 만든 `dict`를 미리 정의한 Pydantic 모델에 넣어서 검증하면 훨씬 안전합니다.
+```python
+try:
+    if "ticket_id" in data:
+        status_model = IntermediateStatus(**data)
+    else:
+        result_model = FinalResult(**data)
+except ValidationError:
+    # 일반 텍스트로 간주
+
+```
+
+
+
+### 결론
+
+중간 상태와 최종 응답을 모두 스키마로 처리하는 것은 가능하며, **`part.text` 기반의 필터링 로직**을 공통 함수로 만들어 두 단계(`run_async` 호출 시점들)에서 모두 사용하시면 아주 깔끔하게 구현됩니다.
+
+이제 중간 상태 메시지도 예쁘게 UI에 뿌려줄 수 있겠네요! 추가로 중간 상태 응답에 포함하고 싶은 특정 필드나 형식이 있으신가요?
+
+
+
+-----
+
 소프트웨어 전문가로서 분석해 본 결과, 사용자님께서 구현하시려는 것은 **ADK의 롱러닝 도구 실행 흐름의 마지막 단계(Stage 3: Resume)**입니다.
 현재 updated_response에 이미 폴링을 통해 얻은 최종 결과 데이터(예: 'status': 'approved')가 들어 있다면, 이를 사용자에게 최종적으로 보여주기 위해 yield를 통해 이벤트를 스트리밍해야 합니다.
 가장 중요한 포인트는 runner.run_async가 반환하는 제너레이터(Generator)를 다시 순회(loop)하면서 그 결과물인 event를 밖으로 내보내는 것입니다.
