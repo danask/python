@@ -1,4 +1,45 @@
 
+전문가 관점에서 분석했을 때, troubleshoot은 잘 되고 device_info에서만 **"No response returned"**가 발생하는 이유는 에이전트가 사용하는 MCP 도구의 실행 방식과 그에 따른 응답 지연(Time-out) 차이 때문일 가능성이 매우 높습니다.
+두 에이전트의 결정적인 차이점 3가지를 짚어드립니다.
+1. 롱러닝 툴(Long-running Tool)의 유무
+ * Troubleshoot: 주로 지식 기반 검색(RAG)이나 상태 확인 등 비교적 짧은 시간에 끝나는 툴을 사용합니다. 따라서 async with 컨텍스트가 유지되는 동안 결과가 반환됩니다.
+ * Device Info: 장비의 상세 상태를 조회하거나 실시간 진단을 수행하는 MCP 롱러닝 툴을 호출하는 경우가 많습니다. 이 과정에서 폴링(Polling) 로직이 길어지면, runner.run_async 루프가 한참 동안 아무런 이벤트를 뱉지 않게 됩니다.
+2. 비동기 컨텍스트 만료 (Context Timeout)
+RuntimeError: No response returned는 보통 다음 시나리오에서 발생합니다.
+ * async with ChatRunner.get_runner(...) 내부에서 device_info 툴이 실행됨.
+ * 툴 실행이 예상보다 길어지거나 내부에서 예외가 발생함.
+ * FastAPI 미들웨어가 설정한 타임아웃에 먼저 걸리거나, runner 객체가 툴 응답을 기다리다 연결을 끊어버림.
+ * 함수가 return문에 도달하기 전에 제어권이 넘어가면서 미들웨어는 "응답 없음"으로 판단함.
+3. 스키마 적용 여부의 부작용
+코드상에서 agent_name != "device_info" 일 때만 스키마를 사용하도록 되어 있는 부분이 있습니다.
+ * troubleshoot은 일반 텍스트 모드로 작동하여 데이터 수집이 유연합니다.
+ * device_info는 특정 출력 스키마를 강제하거나, 반대로 스키마가 없는 상태에서 collect_response가 특정 형식을 기대하고 기다리다 꼬이는 경우가 발생합니다.
+해결을 위한 핵심 디버깅 포인트
+device_info 호출 시에만 터진다면 아래와 같이 최종 응답을 보장하는 구조로 _handle_chat_request 내부를 감싸야 합니다.
+# _handle_chat_request 내부 수정 제안
+try:
+    async with ChatRunner.get_runner(chat_service, agent_name=agent_name, use_output_schema=use_schema) as runner:
+        # 이 안에서 발생하는 모든 일은 result에 담아야 함
+        result = await collect_response_with_contexts2(runner, user_input, combined_user_id, session_id)
+        
+        # 만약 result가 None이면 여기서 강제로 기본값 할당
+        if not result:
+            result = {"response": "에이전트 응답 생성 실패", "retrieved_contexts": []}
+            
+except Exception as e:
+    logger.error(f"Device Info 처리 중 치명적 에러: {e}", exc_info=True)
+    result = {"response": f"시스템 에러 발생: {str(e)}", "retrieved_contexts": []}
+
+return result # 어떤 경우에도 여기서 return이 되어야 RuntimeError가 안 납니다.
+
+요약
+troubleshoot은 빨리 끝나서 문제가 없었던 것이고, device_info는 내부 툴(MCP) 실행 시간이 길어지면서 return 문에 도달하기 전에 비동기 루프가 깨지는 것이 원인입니다.
+우선 device_info 에이전트가 호출하는 MCP 툴의 로그를 확인해 보시겠어요? 툴이 Success를 찍기 전에 서버 로그에서 RuntimeError가 먼저 올라온다면 타임아웃 문제입니다. 이 경우 collect_ 함수 내부에 중간 yield나 하트비트 로직을 추가해야 합니다.
+Would you like me to check the specific MCP tool configuration for device_info to see if it has a shorter timeout?
+
+
+-----
+
  elif is_eval:
        logger.info(f"================EVAL: agent={agent_name}, session={session_id}")
        use_schema = agent_name == "device_info"  # device_info일 때만 schema 사용
