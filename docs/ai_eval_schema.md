@@ -1,3 +1,123 @@
+여전히 `RuntimeError: No response returned.`가 발생한다면, 이는 코드의 논리적 오류라기보다 **비동기 컨텍스트 매니저(`async with`) 내에서 예외가 발생하여 `return` 문에 도달하지 못하고 함수가 비정상적으로 종료**되기 때문입니다.
+
+특히 `FastAPI` 미들웨어(`logging_context.py`)가 응답을 가로채려는데, 엔드포인트가 예외로 인해 `None`조차 반환하지 못하고 터져버리면 ASGI 서버는 이 에러를 내뱉습니다.
+
+문제를 확실히 해결하기 위해 **가장 바깥쪽에 `try...except`를 배치**하고, 요청하신 두 가지 버전의 최종 수정안을 제안합니다.
+
+---
+
+### 1. 스키마 유지 버전 (구조화된 데이터 중심)
+
+에이전트가 뱉는 순수한 텍스트 조각들을 모아서 마지막에 JSON 파싱을 시도합니다. `generate_events`를 거치지 않으므로 `**author**:` 같은 이름표 오염이 없어 안전합니다.
+
+```python
+async def collect_response_with_contexts_schema(
+    runner: Any, content: types.Content, user_id: str, session_id: str
+) -> dict:
+    response_parts = []
+    try:
+        # runner에서 직접 순수 파트를 수집하여 이름표(author) 오염 방지
+        async for event in runner.run_async(
+            new_message=content,
+            user_id=user_id,
+            session_id=session_id,
+            run_config=RunConfig(streaming_mode=StreamingMode.NONE),
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        response_parts.append(part.text)
+        
+        full_text = "".join(response_parts).strip()
+        if not full_text:
+            return {"response": "No content received", "retrieved_contexts": []}
+
+        # JSON 영역만 추출하여 파싱 시도
+        try:
+            start = full_text.find('{')
+            end = full_text.rfind('}') + 1
+            if start != -1 and end != 0:
+                return {"response": json.loads(full_text[start:end]), "retrieved_contexts": []}
+        except json.JSONDecodeError:
+            pass # 파싱 실패 시 아래에서 원본 텍스트 반환
+
+        return {"response": full_text, "retrieved_contexts": []}
+
+    except Exception as e:
+        logger.error(f"Error in schema collection: {e}")
+        return {"response": f"Error: {str(e)}", "retrieved_contexts": []}
+
+```
+
+---
+
+### 2. 스키마 미유지 버전 (텍스트 로그 중심)
+
+`generate_events`에서 나오는 포맷팅된 문자열을 그대로 합칩니다. 에러 방지를 위해 빈 결과가 나오더라도 반드시 기본 응답을 보장합니다.
+
+```python
+async def collect_response_with_contexts_text(
+    runner: Any, content: types.Content, user_id: str, session_id: str
+) -> dict:
+    response_parts = []
+    try:
+        # 기존 generate_events를 소모하여 포맷팅된 텍스트 수집
+        async for event_text in generate_events(runner, content, user_id, session_id):
+            if event_text:
+                response_parts.append(event_text.strip())
+        
+        final_text = "\n\n".join(response_parts) if response_parts else "No response generated"
+        return {"response": final_text, "retrieved_contexts": []}
+
+    except Exception as e:
+        logger.error(f"Error in text collection: {e}")
+        return {"response": f"Error: {str(e)}", "retrieved_contexts": []}
+
+```
+
+---
+
+### 3. [핵심] `_handle_chat_request` 구조 수정 (에러 방지용)
+
+`RuntimeError: No response returned`를 잡으려면 `async with` 블록 밖으로 리턴값을 확실히 빼내야 합니다.
+
+```python
+async def _handle_chat_request(...):
+    # ... (기존 초기화 로직) ...
+    
+    result = None # 결과를 담을 변수 초기화
+    try:
+        if stream_response:
+            async with ChatRunner.get_runner(chat_service, agent_name=agent_name) as runner:
+                return StreamingResponse(...) # 이 부분은 정상 작동 확인됨
+        
+        else:
+            # Eval 또는 일반 단답형 요청 처리
+            use_schema = (agent_name == "device_info")
+            async with ChatRunner.get_runner(chat_service, agent_name=agent_name, use_output_schema=use_schema) as runner:
+                # 사용자가 선택한 버전의 함수 호출
+                result = await collect_response_with_contexts_schema(runner, user_input, combined_user_id, session_id)
+                
+    except Exception as e:
+        logger.error(f"Critical error in _handle_chat_request: {e}")
+        result = {"response": f"Internal Server Error: {str(e)}", "retrieved_contexts": []}
+
+    # 블록 밖에서 최종적으로 결과가 있는지 검증 후 반환
+    if result is None:
+        return {"response": "System failed to produce a response.", "retrieved_contexts": []}
+    
+    return result
+
+```
+
+### 왜 이렇게 해야 하나요?
+
+현재 사용자님의 코드는 `async with` 안에서 모든 처리를 하려다 보니, 내부에서 작은 예외만 발생해도 **함수가 중간에 튕겨져 나가버립니다.** 위와 같이 `result` 변수를 미리 선언하고 마지막에 명시적으로 `return result`를 해주면, 어떤 에러가 나더라도 최소한 에러 메시지가 담긴 JSON 응답이라도 FE에 전달되어 `RuntimeError`를 막을 수 있습니다.
+
+**버전 1(스키마 유지)**을 적용하여 `device_info`를 다시 테스트해 보시겠어요? 이번에는 에러가 나더라도 최소한 로그에 원인이 찍히고 화면에는 에러 메시지가 나올 것입니다. 다음 단계로 무엇을 도와드릴까요?
+
+-----
+
 트레이스백을 보니 문제의 핵심은 `RuntimeError: No response returned.`입니다. 이 에러는 FastAPI(Starlette) 미들웨어 스택에서 **엔드포인트 함수가 아무런 응답(Response) 객체를 반환하지 않았을 때** 발생합니다.
 
 `eval-device-info` 요청 시 이 에러가 발생하는 이유는 `_handle_chat_request` 함수 내부의 `is_eval` 조건문 블록에서 **결과값을 제대로 `return`하지 못하거나, 그 안에서 호출하는 함수가 예기치 않게 종료**되었기 때문일 확률이 매우 높습니다.
