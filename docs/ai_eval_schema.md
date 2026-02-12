@@ -1,4 +1,45 @@
 
+ elif is_eval:
+       logger.info(f"================EVAL: agent={agent_name}, session={session_id}")
+       use_schema = agent_name == "device_info"  # device_info일 때만 schema 사용
+       
+       try:
+           async with ChatRunner.get_runner(
+               chat_service, agent_name=agent_name, use_output_schema=use_schema
+           ) as runner:
+               logger.info(f"[DEBUG] Runner created for agent: {agent_name}")
+               
+               # StreamingResponse와 동일한 방식으로 이벤트 수집
+               response_parts = []
+               event_count = 0
+               
+               async for event in runner.run_async(
+                   new_message=user_input,
+                   user_id=combined_user_id,
+                   session_id=session_id,
+                   run_config=RunConfig(streaming_mode=StreamingMode.NONE),
+               ):
+                   event_count += 1
+                   event_text = get_response_text_from_event(event)
+                   if event_text:
+                       response_parts.append(event_text)
+               
+               logger.info(f"[DEBUG] Collected {event_count} events, {len(response_parts)} non-empty parts")
+               
+               response_text = "\n".join(response_parts) if response_parts else "No response generated"
+               result = {"response": response_text, "retrieved_contexts": []}
+               
+               context_count = len(result.get("retrieved_contexts", []))
+               logger.info(f"================EVAL: Response generated with {context_count} contexts")
+               
+               return result
+               
+       except Exception as e:
+           logger.error(f"Error in eval request for {agent_name}: {str(e)}", exc_info=True)
+           return {"error": str(e), "retrieved_contexts": [], "success": False}
+
+-----
+
 ## 수정된 부분 2곳:
 
 ### 1. **229-252번 라인** (is_eval 분기)
