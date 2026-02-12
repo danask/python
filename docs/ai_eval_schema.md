@@ -1,3 +1,74 @@
+
+## 수정된 부분 2곳:
+
+### 1. **229-252번 라인** (is_eval 분기)
+
+**변경 전:**
+```python
+elif is_eval:
+    logger.info(f"================EVAL: ======================")
+    use_schema = agent_name != "device_info"
+    async with ChatRunner.get_runner(
+        chat_service, agent_name=agent_name, use_output_schema=use_schema
+    ) as runner:
+        result = await collect_response_with_contexts2(
+            runner, user_input, combined_user_id, session_id
+        )
+        # context_count = len(result.get("retrieved_contexts", []))
+        # logger.info(f"================EVAL: Response generated with {context_count} contexts")
+        return result  # ← 문제: context manager 안에서 바로 return
+```
+
+**변경 후:**
+```python
+elif is_eval:
+    logger.info(f"================EVAL: agent={agent_name}, session={session_id}")
+    use_schema = agent_name == "device_info"  # ← != 에서 == 로 변경
+    result = None
+    try:
+        async with ChatRunner.get_runner(
+            chat_service, agent_name=agent_name, use_output_schema=use_schema
+        ) as runner:
+            logger.info(f"[DEBUG] Runner created for agent: {agent_name}")
+            result = await collect_response_with_contexts2(
+                runner, user_input, combined_user_id, session_id
+            )
+            logger.info(f"[DEBUG] Response collected successfully")
+    except Exception as e:
+        logger.error(f"Error in eval request for {agent_name}: {str(e)}", exc_info=True)
+        return {"error": str(e), "retrieved_contexts": [], "success": False}
+    
+    if not result:
+        logger.error(f"No result generated for agent: {agent_name}")
+        return {"error": "No response generated", "retrieved_contexts": [], "success": False}
+    
+    context_count = len(result.get("retrieved_contexts", []))
+    logger.info(f"================EVAL: Response generated with {context_count} contexts")
+    return result  # ← context manager 밖에서 return
+```
+
+### 2. **253-279번 라인** (collect_response_with_contexts2 함수)
+
+**변경 전:**
+```python
+async for event_text in generate_events(runner, content, user_id, session_id):
+    response_parts.append(event_text)  # ← 빈 문자열도 추가됨
+```
+
+**변경 후:**
+```python
+async for event_text in generate_events(runner, content, user_id, session_id):
+    event_count += 1
+    if event_text:  # ← 빈 문자열 필터링 추가
+        response_parts.append(event_text)
+```
+
+---
+
+**핵심은 1번 수정**: context manager 안에서 바로 return하지 않고 밖에서 return하도록 변경!
+
+-----
+
 여전히 `RuntimeError: No response returned.`가 발생한다면, 이는 코드의 논리적 오류라기보다 **비동기 컨텍스트 매니저(`async with`) 내에서 예외가 발생하여 `return` 문에 도달하지 못하고 함수가 비정상적으로 종료**되기 때문입니다.
 
 특히 `FastAPI` 미들웨어(`logging_context.py`)가 응답을 가로채려는데, 엔드포인트가 예외로 인해 `None`조차 반환하지 못하고 터져버리면 ASGI 서버는 이 에러를 내뱉습니다.
