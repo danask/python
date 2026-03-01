@@ -1,3 +1,118 @@
+
+사용자님의 요청에 따라, **롱러닝 도구의 모든 응답을 누락 없이 수집하고 최종적으로 정리된 `full_output`을 생성**할 수 있도록 `prompts.py`와 `fe_tools.py`를 업데이트해 드립니다.
+
+핵심 수정 사항은 에이전트가 "데이터가 아직 더 올 것이 있다"는 것을 인지하게 하고, 모든 조각이 모였을 때만 `set_model_response`를 호출하도록 강제하는 것입니다.
+
+---
+
+### 1. `prompts.py` 업데이트 (인스트럭션 강화)
+
+에이전트에게 데이터 누적 의무와 최종 출력 형식을 엄격하게 정의했습니다.
+
+```python
+"""Knox Device Agent Prompts"""
+
+# ... (DESCRIPTION 등 기존 내용 유지) ...
+
+INSTRUCTION = """
+# Knox AI Assist Device Info Agent
+
+-- (중략) --
+
+**IMPORTANT WORKFLOW**:
+
+### Long-Running Tool Responses
+Long-running tools (like `usp_udl-_getUnifiedDevices_1`, `kme-device-_getBulkEnrollDevices`, etc.) may send **multiple sequential responses** before completion. You MUST follow these rules strictly:
+
+1. **Mandatory Data Accumulation**: Do NOT ignore previous data chunks. As new data arrives via 'synthetic_events', you must append it to your internal memory.
+2. **Wait for Completion**: Check the 'status' field in the tool response. If 'status' is 'processing', do NOT call `set_model_response` yet. Wait until you receive a response that implies completion or until you have gathered all necessary information requested by the user.
+3. **Comprehensive Aggregation**: Your final `full_output` must be a **complete, consolidated report** of ALL data received across ALL tool response chunks. 
+   - Partial summaries are strictly forbidden.
+   - If 100 devices were found across 3 chunks, all 100 must be reflected in the final output.
+4. **Final Response Formatting**: 
+   - Call `set_model_response` ONLY when the data gathering is 100% finished.
+   - The `full_output` field should contain a well-formatted (Markdown table or list) comprehensive result.
+5. **No Intermediate Chatting**: Do not send intermediate conversational text like "I'm still gathering..." to the user. Focus on collecting the data and providing the final formatted response.
+
+### General Rule
+Only call `set_model_response` when you have collected **ALL** the data needed to provide a complete, professional, and comprehensive answer. The user expects a single, high-quality final report containing all retrieved details.
+
+---
+"""
+
+```
+
+---
+
+### 2. `fe_tools.py` 업데이트 (컨텍스트 주입 로직)
+
+에이전트가 데이터를 받을 때, 이것이 "전체 중 일부"임을 명확히 알 수 있도록 인스트럭션을 데이터와 함께 주입합니다.
+
+```python
+# fe_tools.py 내부 chat_device_info 함수 내 루프 부분 수정
+
+# ... (기존 상단 로직 유지) ...
+
+            if long_running_function_response:
+                logger.info(f"Long-running tool response received: {long_running_function_response}")
+                
+                # 에이전트가 '이게 끝이 아님'을 알 수 있도록 가이드 메시지 추가
+                wrapped_response = {
+                    "status": "processing", # 현재 진행 중임을 명시
+                    "data_chunk": long_running_function_response.get("response"),
+                    "instruction": (
+                        "This is a partial data chunk from a long-running process. "
+                        "Keep this in your memory and wait for the next chunk or completion. "
+                        "Do NOT generate the final response until you have all the data."
+                    )
+                }
+
+                try:
+                    synthetic_event = {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        wrapped_response, ensure_ascii=False
+                                    )
+                                }
+                            ],
+                            "role": "model", # 에이전트의 이전 기억처럼 주입
+                        },
+                        "author": "device_info_collector", # 출처 명시
+                    }
+                    
+                    # 진행률 업데이트 및 에이전트에게 데이터 전달
+                    await ctx.report_progress(progress, 100, f"Collecting data chunk...")
+                    await ctx.info(synthetic_event)
+                    
+                    # 중요: 여기서 바로 return하지 않고 다음 이벤트를 계속 기다림
+                    
+                except Exception as e:
+                    logger.exception(f"Error wrapping agent text response: {e}")
+                    pass
+
+# ... (이하 생략) ...
+
+```
+
+---
+
+### 3. 개선된 로직의 작동 원리
+
+1. **에이전트의 인식 변화**: 이전에는 툴 응답이 오면 에이전트가 바로 "답변해야지"라고 생각했다면, 이제는 `status: processing`과 `instruction`을 보고 **"아직 데이터를 더 모아야 하는구나"**라고 판단하게 됩니다.
+2. **`full_output`의 품질 향상**: `prompts.py`에 "Partial summaries are strictly forbidden(부분 요약 엄격 금지)"를 명시함으로써, 에이전트가 마지막 응답 시점에 메모리에 쌓인 모든 `data_chunk`를 합쳐서 출력하게 됩니다.
+3. **FE 스트림 안정화**: 중간에 `ctx.info`로 나가는 `synthetic_event`는 FE에서 스킵하더라도, 에이전트의 내부 '생각' 회로에는 데이터가 차곡차곡 쌓이게 되어 최종 결과물인 `full_output`이 풍부해집니다.
+
+### 추가 팁
+
+만약 데이터 양이 너무 많아(예: 장비 수천 대) 에이전트의 토큰 한계를 넘어서는 경우에는, `full_output`에 전체를 다 넣기보다 **"총 X대의 장비가 조회되었습니다. 상세 내용은 아래 파일을 확인하세요"**와 같은 방식으로 처리하도록 `prompts.py`를 살짝 더 조정할 필요가 있을 수 있습니다.
+
+수정된 파일을 적용해 보시고, 여전히 특정 부분이 누락된다면 에이전트가 수신한 마지막 `synthetic_event`의 로그를 확인해 주세요! 다른 도움이 더 필요하신가요?
+
+
+--------
+
 전문가로서 FE(Front-End)로 데이터가 전달되지 않는 이유를 정확히 짚어드리겠습니다.
 
 현재 코드에서 **"로그에는 찍히는데 FE에는 안 나오는"** 가장 큰 이유는 **SSE(Server-Sent Events)의 규격(`data: ` 접두사와 `\n\n` 종료문자)** 때문입니다. FE의 `EventSource`나 `fetch` 스트림 라이브러리는 특정 형식을 갖추지 않은 텍스트는 이벤트로 인식하지 않고 무시합니다.
